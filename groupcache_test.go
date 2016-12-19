@@ -31,8 +31,8 @@ import (
 
 	"github.com/golang/protobuf/proto"
 
-	pb "github.com/golang/groupcache/groupcachepb"
-	testpb "github.com/golang/groupcache/testpb"
+	pb "github.com/cyber4ron/groupcache/groupcachepb"
+	testpb "github.com/cyber4ron/groupcache/testpb"
 )
 
 var (
@@ -322,6 +322,8 @@ func TestPeers(t *testing.T) {
 }
 
 func TestTruncatingByteSliceTarget(t *testing.T) {
+	once.Do(testSetup)
+
 	var buf [100]byte
 	s := buf[:]
 	if err := stringGroup.Get(dummyCtx, "short", TruncatingByteSliceSink(&s)); err != nil {
@@ -387,8 +389,10 @@ func (g *orderedFlightGroup) Do(key string, fn func() (interface{}, error)) (int
 func TestNoDedup(t *testing.T) {
 	const testkey = "testkey"
 	const testval = "testval"
+	ts := GetUnixTime()
+	packedBytes, _ := packTimestamp([]byte(testval), ts)
 	g := newGroup("testgroup", 1024, GetterFunc(func(_ Context, key string, dest Sink) error {
-		return dest.SetString(testval)
+		return dest.SetBytes(packedBytes)
 	}), nil)
 
 	orderedGroup := &orderedFlightGroup{
@@ -425,7 +429,7 @@ func TestNoDedup(t *testing.T) {
 	orderedGroup.stage2 <- true
 
 	for i := 0; i < 2; i++ {
-		if s := <-resc; s != testval {
+		if s := <-resc; s != string(packedBytes) {
 			t.Errorf("result is %s want %s", s, testval)
 		}
 	}
@@ -435,10 +439,14 @@ func TestNoDedup(t *testing.T) {
 		t.Errorf("mainCache has %d items, want %d", g.mainCache.items(), wantItems)
 	}
 
+	fmt.Printf("stat: %+v\n", g.Stats)
+	fmt.Printf("hot cache: %+v\n", g.hotCache.stats())
+	fmt.Printf("main cache: %+v\n", g.mainCache.stats())
+
 	// If the singleflight callback doesn't double-check the cache again
 	// upon entry, we would increment nbytes twice but the entry would
 	// only be in the cache once.
-	const wantBytes = int64(len(testkey) + len(testval))
+	wantBytes := int64(len(testkey) + len(packedBytes))
 	if g.mainCache.nbytes != wantBytes {
 		t.Errorf("cache has %d bytes, want %d", g.mainCache.nbytes, wantBytes)
 	}

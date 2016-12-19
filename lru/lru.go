@@ -70,6 +70,14 @@ func (c *Cache) Add(key Key, value interface{}) {
 	}
 }
 
+func (c *Cache) Contains(key Key) bool {
+	if c.cache == nil {
+		return false
+	}
+	_, hit := c.cache[key]
+	return hit
+}
+
 // Get looks up a key's value from the cache.
 func (c *Cache) Get(key Key) (value interface{}, ok bool) {
 	if c.cache == nil {

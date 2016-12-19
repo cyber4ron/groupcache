@@ -30,10 +30,12 @@ import (
 	"strconv"
 	"sync"
 	"sync/atomic"
+	"time"
 
-	pb "github.com/golang/groupcache/groupcachepb"
-	"github.com/golang/groupcache/lru"
-	"github.com/golang/groupcache/singleflight"
+	pb "github.com/cyber4ron/groupcache/groupcachepb"
+	"github.com/cyber4ron/groupcache/lru"
+	"github.com/cyber4ron/groupcache/singleflight"
+	log "github.com/Sirupsen/logrus"
 )
 
 // A Getter loads data for a key.
@@ -170,6 +172,10 @@ type Group struct {
 
 	// Stats are statistics on the group.
 	Stats Stats
+
+	// For expiration functionality.
+	expiration      time.Duration
+	loadTimeout     time.Duration
 }
 
 // flightGroup is defined as an interface which flightgroup.Group
@@ -191,11 +197,18 @@ type Stats struct {
 	LocalLoads     AtomicInt // total good local loads
 	LocalLoadErrs  AtomicInt // total bad local loads
 	ServerRequests AtomicInt // gets that came over the network from peers
+	Expires        AtomicInt // times of request expired object
+	LoadsExpire    AtomicInt // times of reload expired object
+	Cleanups       AtomicInt // times of cleaning expired object
 }
 
 // Name returns the name of the group.
 func (g *Group) Name() string {
 	return g.name
+}
+
+func (g *Group) GetMaxCacheSize() int64 {
+	return g.cacheBytes
 }
 
 func (g *Group) initPeers() {
@@ -210,84 +223,84 @@ func (g *Group) Get(ctx Context, key string, dest Sink) error {
 	if dest == nil {
 		return errors.New("groupcache: nil dest Sink")
 	}
-	value, cacheHit := g.lookupCache(key)
+	value, which, cacheHit := g.lookupCache(key)
 
 	if cacheHit {
 		g.Stats.CacheHits.Add(1)
-		return setSinkView(dest, value)
+		if g.expiration > 0 {
+			return g.handleExpiration(ctx, key, dest, value, which)
+		} else {
+			return setSinkView(dest, value)
+		}
 	}
 
-	// Optimization to avoid double unmarshalling or copying: keep
-	// track of whether the dest was already populated. One caller
-	// (if local) will set this; the losers will not. The common
-	// case will likely be one caller.
+	_, err := g.loadAndPopulate(ctx, key, dest, false)
+	return err
+}
+
+// loadAndPopulate loads the key and populates dest
+func (g *Group) loadAndPopulate(ctx Context, key string, dest Sink, expired bool) (CacheType, error) {
 	destPopulated := false
-	value, destPopulated, err := g.load(ctx, key, dest)
+	value, which, destPopulated, err := g.load(ctx, key, dest, expired)
 	if err != nil {
-		return err
+		return None, err
 	}
 	if destPopulated {
-		return nil
+		return which, nil
 	}
-	return setSinkView(dest, value)
+	return None, setSinkView(dest, value)
 }
 
 // load loads key either by invoking the getter locally or by sending it to another machine.
-func (g *Group) load(ctx Context, key string, dest Sink) (value ByteView, destPopulated bool, err error) {
+// which tracks which cache the load function write. if err != nil, which should be None
+func (g *Group) load(ctx Context, key string, dest Sink, expired bool) (value ByteView, which CacheType, destPopulated bool, err error) {
 	g.Stats.Loads.Add(1)
-	viewi, err := g.loadGroup.Do(key, func() (interface{}, error) {
-		// Check the cache again because singleflight can only dedup calls
-		// that overlap concurrently.  It's possible for 2 concurrent
-		// requests to miss the cache, resulting in 2 load() calls.  An
-		// unfortunate goroutine scheduling would result in this callback
-		// being run twice, serially.  If we don't check the cache again,
-		// cache.nbytes would be incremented below even though there will
-		// be only one entry for this key.
-		//
-		// Consider the following serialized event ordering for two
-		// goroutines in which this callback gets called twice for hte
-		// same key:
-		// 1: Get("key")
-		// 2: Get("key")
-		// 1: lookupCache("key")
-		// 2: lookupCache("key")
-		// 1: load("key")
-		// 2: load("key")
-		// 1: loadGroup.Do("key", fn)
-		// 1: fn()
-		// 2: loadGroup.Do("key", fn)
-		// 2: fn()
-		if value, cacheHit := g.lookupCache(key); cacheHit {
-			g.Stats.CacheHits.Add(1)
-			return value, nil
+	viewI, err := g.loadGroup.Do(key, func() (interface{}, error) {
+		which = None
+		if expired {
+			g.Stats.LoadsExpire.Add(1)
+		}
+		if value, _, cacheHit := g.lookupCache(key); cacheHit {
+			writeTs, err := getTimestampByteView(value)
+			if err != nil {
+				return nil, err
+			}
+			if GetUnixTime() - writeTs - int64(g.expiration.Seconds()) < 0 {
+				g.Stats.CacheHits.Add(1)
+				return value, nil
+			}
 		}
 		g.Stats.LoadsDeduped.Add(1)
 		var value ByteView
 		var err error
+
+		// try to get from peer if authorized by peer
 		if peer, ok := g.peers.PickPeer(key); ok {
-			value, err = g.getFromPeer(ctx, peer, key)
+			value, which, err = g.getFromPeer(ctx, peer, key)
 			if err == nil {
 				g.Stats.PeerLoads.Add(1)
 				return value, nil
 			}
+			log.Errorf("peer eror: %v", err)
 			g.Stats.PeerErrors.Add(1)
-			// TODO(bradfitz): log the peer's error? keep
-			// log of the past few for /groupcachez?  It's
-			// probably boring (normal task movement), so not
-			// worth logging I imagine.
 		}
+
+		// authorized by local host or peer failed
 		value, err = g.getLocally(ctx, key, dest)
 		if err != nil {
 			g.Stats.LocalLoadErrs.Add(1)
 			return nil, err
 		}
 		g.Stats.LocalLoads.Add(1)
-		destPopulated = true // only one caller of load gets this return value
+
+		// only one caller of load gets this return value
+		destPopulated = true
 		g.populateCache(key, value, &g.mainCache)
+		which = MainCache
 		return value, nil
 	})
 	if err == nil {
-		value = viewi.(ByteView)
+		value = viewI.(ByteView)
 	}
 	return
 }
@@ -300,7 +313,8 @@ func (g *Group) getLocally(ctx Context, key string, dest Sink) (ByteView, error)
 	return dest.view()
 }
 
-func (g *Group) getFromPeer(ctx Context, peer ProtoGetter, key string) (ByteView, error) {
+// CacheType tracks which cache the object write to. if err != nil, CacheType should be None
+func (g *Group) getFromPeer(ctx Context, peer ProtoGetter, key string) (ByteView, CacheType, error) {
 	req := &pb.GetRequest{
 		Group: &g.name,
 		Key:   &key,
@@ -308,27 +322,31 @@ func (g *Group) getFromPeer(ctx Context, peer ProtoGetter, key string) (ByteView
 	res := &pb.GetResponse{}
 	err := peer.Get(ctx, req, res)
 	if err != nil {
-		return ByteView{}, err
+		return ByteView{}, None, err
 	}
 	value := ByteView{b: res.Value}
-	// TODO(bradfitz): use res.MinuteQps or something smart to
-	// conditionally populate hotCache.  For now just do it some
-	// percentage of the time.
 	if rand.Intn(10) == 0 {
 		g.populateCache(key, value, &g.hotCache)
+		return value, HotCache, nil
 	}
-	return value, nil
+	return value, None, nil
 }
 
-func (g *Group) lookupCache(key string) (value ByteView, ok bool) {
+func (g *Group) lookupCache(key string) (value ByteView, which CacheType, ok bool) {
+	which = None
 	if g.cacheBytes <= 0 {
 		return
 	}
 	value, ok = g.mainCache.get(key)
 	if ok {
+		which = MainCache
 		return
 	}
 	value, ok = g.hotCache.get(key)
+	if ok {
+		which = HotCache
+		return
+	}
 	return
 }
 
@@ -342,15 +360,12 @@ func (g *Group) populateCache(key string, value ByteView, cache *cache) {
 	for {
 		mainBytes := g.mainCache.bytes()
 		hotBytes := g.hotCache.bytes()
-		if mainBytes+hotBytes <= g.cacheBytes {
+		if mainBytes + hotBytes <= g.cacheBytes {
 			return
 		}
 
-		// TODO(bradfitz): this is good-enough-for-now logic.
-		// It should be something based on measurements and/or
-		// respecting the costs of different resources.
 		victim := &g.mainCache
-		if hotBytes > mainBytes/8 {
+		if hotBytes > mainBytes / 8 {
 			victim = &g.hotCache
 		}
 		victim.removeOldest()
@@ -369,6 +384,9 @@ const (
 	// enough to replicate to this node, even though it's not the
 	// owner.
 	HotCache
+
+	// None means none of above.
+	None
 )
 
 // CacheStats returns stats about the provided cache within the group.
@@ -418,6 +436,10 @@ func (c *cache) add(key string, value ByteView) {
 			},
 		}
 	}
+	// remove dup key
+	if c.lru.Contains(key) {
+		c.lru.Remove(key)
+	}
 	c.lru.Add(key, value)
 	c.nbytes += int64(len(key)) + int64(value.Len())
 }
@@ -435,6 +457,14 @@ func (c *cache) get(key string) (value ByteView, ok bool) {
 	}
 	c.nhit++
 	return vi.(ByteView), true
+}
+
+func (c *cache) remove(key string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.lru != nil {
+		c.lru.Remove(key)
+	}
 }
 
 func (c *cache) removeOldest() {
