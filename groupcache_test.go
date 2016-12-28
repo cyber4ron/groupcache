@@ -241,6 +241,10 @@ func (p *fakePeer) Get(_ Context, in *pb.GetRequest, out *pb.GetResponse) error 
 
 type fakePeers []ProtoGetter
 
+func (fakePeers) RegisterAndWatch() error {
+	return errors.New("no implementation")
+}
+
 func (p fakePeers) PickPeer(key string) (peer ProtoGetter, ok bool) {
 	if len(p) == 0 {
 		return

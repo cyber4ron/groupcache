@@ -39,10 +39,14 @@ type PeerPicker interface {
 	// and true to indicate that a remote peer was nominated.
 	// It returns nil, false if the key owner is the current peer.
 	PickPeer(key string) (peer ProtoGetter, ok bool)
+
+	RegisterAndWatch() error
 }
 
 // NoPeers is an implementation of PeerPicker that never finds a peer.
-type NoPeers struct{}
+type NoPeers struct{
+	noWatchImplementation
+}
 
 func (NoPeers) PickPeer(key string) (peer ProtoGetter, ok bool) { return }
 

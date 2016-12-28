@@ -142,6 +142,7 @@ func TestExpires(t *testing.T) {
 var peerChannel chan int
 
 type MockPeerPicker struct {
+	noWatchImplementation
 	PeerList []MockGetter
 }
 
@@ -230,7 +231,7 @@ func TestExpires2(t *testing.T) {
 	content, timestamp = callGet(t, testKey)		// will cache in main cache and remove from hot cache
 	verifyTimestamp(t, 705, timestamp)
 	verifyContent(t, "barbar1", content)
-	verifyInt64(t, 1, timestampGroup.hotCache.stats().Evictions)
+	verifyInt64(t, 1, timestampGroup.hotCache.stats().Evictions) // maybe error, because object are added to hot cache by chance
 	verifyInt64(t, 19, timestampGroup.mainCache.stats().Bytes)
 
 	printGroupStat()

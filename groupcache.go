@@ -35,7 +35,7 @@ import (
 	pb "github.com/cyber4ron/groupcache/groupcachepb"
 	"github.com/cyber4ron/groupcache/lru"
 	"github.com/cyber4ron/groupcache/singleflight"
-	log "github.com/Sirupsen/logrus"
+	log "github.com/Sirupsen/logrus" // todo: use log provider
 )
 
 // A Getter loads data for a key.
@@ -281,7 +281,7 @@ func (g *Group) load(ctx Context, key string, dest Sink, expired bool) (value By
 				g.Stats.PeerLoads.Add(1)
 				return value, nil
 			}
-			log.Errorf("peer eror: %v", err)
+			log.Errorf("peer error: %v", err)
 			g.Stats.PeerErrors.Add(1)
 		}
 

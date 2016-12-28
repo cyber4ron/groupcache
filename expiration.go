@@ -2,7 +2,7 @@ package groupcache
 
 import (
 	"time"
-	log "github.com/Sirupsen/logrus"
+	log "github.com/Sirupsen/logrus" // todo: use log provider
 )
 
 type TimeProvider interface {
@@ -85,6 +85,7 @@ func (g *Group) handleExpiration(ctx Context, key string, dest Sink, value ByteV
 	age := GetUnixTime() - writeTs
 	// >=0 means expired
 	if age - int64(g.expiration.Seconds()) >= 0 {
+		log.Debugf("object expired, key: %s, age: %d, expiration: %d seconds", key, age, g.expiration.Seconds())
 		g.Stats.Expires.Add(1)
 		loadErr := make(chan error)
 		var backgroundBytes []byte

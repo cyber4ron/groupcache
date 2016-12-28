@@ -55,6 +55,9 @@ type HTTPPool struct {
 	mu          sync.Mutex // guards peers and httpGetters
 	peers       *consistenthash.Map
 	httpGetters map[string]*httpGetter // keyed by e.g. "http://10.0.0.2:8008"
+
+	// configWatcher watches config changes in zk
+	configWatcher	*ConfigWatcher
 }
 
 // HTTPPoolOptions are the configurations of a HTTPPool.
@@ -70,6 +73,9 @@ type HTTPPoolOptions struct {
 	// HashFn specifies the hash function of the consistent hash.
 	// If blank, it defaults to crc32.ChecksumIEEE.
 	HashFn consistenthash.Hash
+
+	// configurations of a ConfigWatcher
+	ConfigOpts
 }
 
 // NewHTTPPool initializes an HTTP pool of peers, and registers itself as a PeerPicker.
@@ -107,6 +113,12 @@ func NewHTTPPoolOpts(self string, o *HTTPPoolOptions) *HTTPPool {
 		p.opts.Replicas = defaultReplicas
 	}
 	p.peers = consistenthash.New(p.opts.Replicas, p.opts.HashFn)
+
+	watcher, err := NewConfigWatcher(p.opts.ZkServers, p.opts.ParentZNode, p.opts.SessionTimeout)
+	if err != nil {
+		panic(err)
+	}
+	p.configWatcher = watcher
 
 	RegisterPeerPicker(func() PeerPicker { return p })
 	return p

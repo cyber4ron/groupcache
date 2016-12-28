@@ -29,6 +29,10 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"github.com/samuel/go-zookeeper/zk"
+	"hash/crc32"
+	"sort"
+	"fmt"
 )
 
 var (
@@ -62,6 +66,7 @@ func TestHTTPPool(t *testing.T) {
 			"--test_peer_addrs="+strings.Join(childAddr, ","),
 			"--test_peer_index="+strconv.Itoa(i),
 		)
+		cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 		cmds = append(cmds, cmd)
 		wg.Add(1)
 		if err := cmd.Start(); err != nil {
@@ -79,7 +84,10 @@ func TestHTTPPool(t *testing.T) {
 	wg.Wait()
 
 	// Use a dummy self address so that we don't handle gets in-process.
-	p := NewHTTPPool("should-be-ignored")
+	p := NewHTTPPoolOpts("should-be-ignored", &HTTPPoolOptions{
+		BasePath: "/_groupcache/",
+		ConfigOpts: ConfigOpts{"127.0.0.1:2181", "/common", time.Second},
+	})
 	p.Set(addrToURL(childAddr)...)
 
 	// Dummy getter function. Gets should go to children only.
@@ -113,7 +121,10 @@ func testKeys(n int) (keys []string) {
 func beChildForTestHTTPPool() {
 	addrs := strings.Split(*peerAddrs, ",")
 
-	p := NewHTTPPool("http://" + addrs[*peerIndex])
+	p := NewHTTPPoolOpts("http://" + addrs[*peerIndex], &HTTPPoolOptions{
+		BasePath: "/_groupcache/",
+		ConfigOpts: ConfigOpts{"127.0.0.1:2181", "/common", time.Second},
+	})
 	p.Set(addrToURL(addrs)...)
 
 	getter := GetterFunc(func(ctx Context, key string, dest Sink) error {
@@ -122,7 +133,8 @@ func beChildForTestHTTPPool() {
 	})
 	NewGroup("httpPoolTest", 1<<20, getter)
 
-	log.Fatal(http.ListenAndServe(addrs[*peerIndex], p))
+	http.Handle(p.opts.BasePath, p)
+	log.Fatal(http.ListenAndServe(addrs[*peerIndex], nil))
 }
 
 // This is racy. Another process could swoop in and steal the port between the
@@ -163,4 +175,119 @@ func awaitAddrReady(t *testing.T, addr string, wg *sync.WaitGroup) {
 		}
 		time.Sleep(delay)
 	}
+}
+
+func AddZNode(conn *zk.Conn, path string) {
+	_, err := conn.Create(path, nil, int32(zk.FlagEphemeral), zk.WorldACL(zk.PermAll))
+	if err != nil {
+		fmt.Println(err)
+	}
+}
+
+func DeleteZNode(conn *zk.Conn, path string) {
+	err := conn.Delete(path, -1)
+	if err != nil {
+		fmt.Println(err)
+	}
+}
+
+func verifyArrayInt(t *testing.T, msg string, want []int, got []int) {
+	if len(want) != len(got) {
+		t.Errorf("%s, Got: %d, Want:%d", msg, got, want)
+		return
+	}
+	for i, e := range want {
+		if got[i] != e {
+			t.Errorf("%s, Got: %d, Want:%d", msg, got, want)
+			return
+		}
+	}
+}
+
+func getKeys(replicas int, urls ...string) []int {
+	var keys []int
+	hashMap := make(map[int]string)
+	for _, url := range urls {
+		for i := 0; i < replicas; i++ {
+			hash := int(crc32.ChecksumIEEE([]byte(strconv.Itoa(i) + url)))
+			keys = append(keys, hash)
+			hashMap[hash] = url
+		}
+	}
+	sort.Ints(keys)
+	return keys
+}
+
+func TestConfigWatch(t *testing.T) {
+	servers := "127.0.0.1:2181"
+	basePath := ""
+	url0 := "http://172.10.10.0:9099"
+	url1 := "http://172.10.10.1:9099"
+	url2 := "http://172.10.10.2:9099"
+	url3 := "http://172.10.10.3:9099"
+	sessionTimeout := time.Second
+	replicas := 2
+
+	time.Sleep(sessionTimeout)
+
+	conn, _, err := zk.Connect(strings.Split(servers, ","), sessionTimeout)
+	if err != nil {
+		panic(err)
+	}
+
+	time.Sleep(sessionTimeout)
+
+	// start http pool1
+	p := NewHTTPPoolOpts(url0, &HTTPPoolOptions{
+		Replicas : replicas,
+		ConfigOpts: ConfigOpts{servers, basePath, sessionTimeout},
+	})
+	err = p.RegisterAndWatch()
+	if err != nil {
+		panic(err)
+	}
+
+	time.Sleep(sessionTimeout)
+
+	verifyArrayInt(t, "url0", getKeys(replicas, url0), p.peers.Keys())
+
+	// start http pool2
+	httpPoolMade = false
+	portPicker = nil
+	p1 := NewHTTPPoolOpts(url1, &HTTPPoolOptions{
+		Replicas : replicas,
+		ConfigOpts: ConfigOpts{servers, basePath, sessionTimeout},
+	})
+	err = p1.RegisterAndWatch()
+	if err != nil {
+		panic(err)
+	}
+
+	// add znode
+	AddZNode(conn, strings.Join([]string{basePath, GroupCacheNodesZNode, url2[7:]}, "/"))
+
+	time.Sleep(sessionTimeout)
+	verifyArrayInt(t, "url0, url1, url2", getKeys(replicas, url0, url1, url2), p.peers.Keys())
+	verifyArrayInt(t, "url0, url1, url2", getKeys(replicas, url0, url1, url2), p1.peers.Keys())
+
+	// add znode
+	AddZNode(conn, strings.Join([]string{basePath, GroupCacheNodesZNode, url3[7:]}, "/"))
+
+	time.Sleep(sessionTimeout)
+	verifyArrayInt(t, "url0, url1, url2, url3", getKeys(replicas, url0, url1, url2, url3), p.peers.Keys())
+	verifyArrayInt(t, "url0, url1, url2, url3", getKeys(replicas, url0, url1, url2, url3), p1.peers.Keys())
+	// delete znode
+	DeleteZNode(conn, strings.Join([]string{basePath, GroupCacheNodesZNode, url3[7:]}, "/"))
+
+	time.Sleep(sessionTimeout)
+	verifyArrayInt(t, "url0, url1, url2", getKeys(replicas, url0, url1, url2), p.peers.Keys())
+	verifyArrayInt(t, "url0, url1, url2", getKeys(replicas, url0, url1, url2), p1.peers.Keys())
+
+	// close p1.configWatcher
+	p1.configWatcher.Close()
+
+	time.Sleep(sessionTimeout)
+	verifyArrayInt(t, "url0, url2", getKeys(replicas, url0, url2), p.peers.Keys())
+
+	time.Sleep(time.Second * 10)
 }

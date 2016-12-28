@@ -21,6 +21,7 @@ import (
 	"hash/crc32"
 	"sort"
 	"strconv"
+	"sync"
 )
 
 type Hash func(data []byte) uint32
@@ -28,6 +29,7 @@ type Hash func(data []byte) uint32
 type Map struct {
 	hash     Hash
 	replicas int
+	mu       sync.RWMutex
 	keys     []int // Sorted
 	hashMap  map[int]string
 }
@@ -46,11 +48,15 @@ func New(replicas int, fn Hash) *Map {
 
 // Returns true if there are no items available.
 func (m *Map) IsEmpty() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	return len(m.keys) == 0
 }
 
 // Adds some keys to the hash.
 func (m *Map) Add(keys ...string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	for _, key := range keys {
 		for i := 0; i < m.replicas; i++ {
 			hash := int(m.hash([]byte(strconv.Itoa(i) + key)))
@@ -63,6 +69,9 @@ func (m *Map) Add(keys ...string) {
 
 // Gets the closest item in the hash to the provided key.
 func (m *Map) Get(key string) string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
 	if m.IsEmpty() {
 		return ""
 	}
@@ -78,4 +87,14 @@ func (m *Map) Get(key string) string {
 	}
 
 	return m.hashMap[m.keys[idx]]
+}
+
+func (m *Map) Keys() []int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	snapshot := make([]int, len(m.keys))
+	copy(snapshot, m.keys)
+
+	return snapshot
 }
