@@ -56,6 +56,12 @@ func (f GetterFunc) Get(ctx Context, key string, dest Sink) error {
 	return f(ctx, key, dest)
 }
 
+const (
+	defaultPipelineConcurrency = 16
+	defaultPipelineCapacity = 10000
+	defaultPipelineMGetTimeout = time.Second * 5
+)
+
 var (
 	mu     sync.RWMutex
 	groups = make(map[string]*Group)
@@ -82,14 +88,25 @@ func GetGroup(name string) *Group {
 // completes.
 //
 // The group name must be unique for each getter.
-func NewGroup(name string, cacheBytes int64, getter Getter) *Group {
-	return newGroup(name, cacheBytes, getter, nil)
+func NewGroup(name string, cacheBytes int64, getter Getter, process ProcessFunc) *Group {
+	return newGroup(name, cacheBytes, getter, nil, process)
+}
+
+func NewGroupOpts(name string, cacheBytes int64, getter Getter, process ProcessFunc, opt *GroupOpts) *Group {
+	return newGroupOpts(name, cacheBytes, getter, nil, process, opt)
 }
 
 // If peers is nil, the peerPicker is called via a sync.Once to initialize it.
-func newGroup(name string, cacheBytes int64, getter Getter, peers PeerPicker) *Group {
+func newGroup(name string, cacheBytes int64, getter Getter, peers PeerPicker, process ProcessFunc) *Group {
+	return newGroupOpts(name, cacheBytes, getter, peers, process, nil)
+}
+
+func newGroupOpts(name string, cacheBytes int64, getter Getter, peers PeerPicker, process ProcessFunc, opt *GroupOpts) *Group {
 	if getter == nil {
 		panic("nil Getter")
+	}
+	if process == nil {
+		process = defaultProcessFunc
 	}
 	mu.Lock()
 	defer mu.Unlock()
@@ -104,6 +121,28 @@ func newGroup(name string, cacheBytes int64, getter Getter, peers PeerPicker) *G
 		cacheBytes: cacheBytes,
 		loadGroup:  &singleflight.Group{},
 	}
+
+	if opt != nil {
+		g.opt = *opt
+	}
+	if g.opt.PipelineConcurrency == 0 {
+		g.opt.PipelineConcurrency = defaultPipelineConcurrency
+	}
+	if g.opt.PipelineCapacity == 0 {
+		g.opt.PipelineCapacity = defaultPipelineCapacity
+	}
+	if g.opt.PipelineMGetTimeout == 0 {
+		g.opt.PipelineMGetTimeout = defaultPipelineMGetTimeout
+	}
+	g.pipeline = &Pipeline{
+		Concurrency: g.opt.PipelineConcurrency,
+		Capacity:    g.opt.PipelineCapacity,
+		MGetTimeout: g.opt.PipelineMGetTimeout,
+		Group:	     g,
+		Process:     process,
+	}
+	g.pipeline.Start()
+
 	if fn := newGroupHook; fn != nil {
 		fn(g)
 	}
@@ -161,21 +200,32 @@ type Group struct {
 	// network card could become the bottleneck on a popular key.
 	// This cache is used sparingly to maximize the total number
 	// of key/value pairs that can be stored globally.
-	hotCache cache
+	hotCache    cache
 
 	// loadGroup ensures that each key is only fetched once
 	// (either locally or remotely), regardless of the number of
 	// concurrent callers.
-	loadGroup flightGroup
+	loadGroup   flightGroup
 
-	_ int32 // force Stats to be 8-byte aligned on 32-bit platforms
+	_           int32 // force Stats to be 8-byte aligned on 32-bit platforms
 
 	// Stats are statistics on the group.
-	Stats Stats
+	Stats       Stats
 
 	// For expiration functionality.
-	expiration      time.Duration
-	loadTimeout     time.Duration
+	expiration  time.Duration
+	loadTimeout time.Duration
+
+	// pipeline for mget
+	pipeline    *Pipeline
+
+	opt         GroupOpts
+}
+
+type GroupOpts struct {
+	PipelineConcurrency int
+	PipelineCapacity    int
+	PipelineMGetTimeout time.Duration
 }
 
 // flightGroup is defined as an interface which flightgroup.Group

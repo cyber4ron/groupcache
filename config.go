@@ -65,6 +65,7 @@ func (w *ConfigWatcher) watchNodeList(process func(map[string]*[]byte) error) er
 			return nil, err
 		}
 
+		log.Infoln("nodes:", nodes)
 		nodeConfig := make(map[string]*[]byte)
 		for _, node := range nodes {
 			nodePath := joinZNode(path, node)

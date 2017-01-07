@@ -64,7 +64,7 @@ func testSetup() {
 		}
 		cacheFills.Add(1)
 		return dest.SetString("ECHO:" + key)
-	}))
+	}), nil)
 
 	protoGroup = NewGroup(protoGroupName, cacheSize, GetterFunc(func(_ Context, key string, dest Sink) error {
 		if key == fromChan {
@@ -75,7 +75,7 @@ func testSetup() {
 			Name: proto.String("ECHO:" + key),
 			City: proto.String("SOME-CITY"),
 		})
-	}))
+	}), nil)
 }
 
 // tests that a Getter's Get method is only called once with two
@@ -267,7 +267,7 @@ func TestPeers(t *testing.T) {
 		localHits++
 		return dest.SetString("got:" + key)
 	}
-	testGroup := newGroup("TestPeers-group", cacheSize, GetterFunc(getter), peerList)
+	testGroup := newGroup("TestPeers-group", cacheSize, GetterFunc(getter), peerList, nil)
 	run := func(name string, n int, wantSummary string) {
 		// Reset counters
 		localHits = 0
@@ -397,7 +397,7 @@ func TestNoDedup(t *testing.T) {
 	packedBytes, _ := packTimestamp([]byte(testval), ts)
 	g := newGroup("testgroup", 1024, GetterFunc(func(_ Context, key string, dest Sink) error {
 		return dest.SetBytes(packedBytes)
-	}), nil)
+	}), nil, nil)
 
 	orderedGroup := &orderedFlightGroup{
 		stage1: make(chan bool),

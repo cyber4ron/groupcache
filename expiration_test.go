@@ -56,7 +56,7 @@ func testingSetup(groupName string) {
 		// should be conservative.
 		time.Sleep(1 * time.Millisecond)
 		return dest.SetTimestampBytes(content, GetUnixTime())
-	}))
+	}), nil)
 }
 
 func callGet(t *testing.T, key string) (content []byte, timestamp int64) {
