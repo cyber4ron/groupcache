@@ -161,7 +161,11 @@ func (p *HTTPPool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	groupName := parts[0]
-	key := parts[1]
+	key, err := url.QueryUnescape(parts[1])
+	if err != nil {
+		http.Error(w, "decoding key: "+err.Error(), http.StatusBadRequest)
+		return
+	}
 
 	// Fetch the value for this group/key.
 	group := GetGroup(groupName)
@@ -176,7 +180,7 @@ func (p *HTTPPool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	group.Stats.ServerRequests.Add(1)
 	var value []byte
-	err := group.Get(ctx, key, AllocatingByteSliceSink(&value))
+	err = group.Get(ctx, key, AllocatingByteSliceSink(&value))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return

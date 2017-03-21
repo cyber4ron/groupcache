@@ -76,6 +76,7 @@ func (g *Group) Evict(key string) {
 }
 
 // handleExpiration reloads object and populates dest if object is expired.
+// TODO: handle reload contention
 func (g *Group) handleExpiration(ctx Context, key string, dest Sink, value ByteView, which CacheType) error {
 	writeTs, err := getTimestampByteView(value)
 	if err != nil {
@@ -85,7 +86,7 @@ func (g *Group) handleExpiration(ctx Context, key string, dest Sink, value ByteV
 	age := GetUnixTime() - writeTs
 	// >=0 means expired
 	if age - int64(g.expiration.Seconds()) >= 0 {
-		log.Debugf("object expired, key: %s, age: %d, expiration: %d seconds", key, age, g.expiration.Seconds())
+		log.Debugf("object expired, key: %s, age: %d, expiration: %f seconds", key, age, g.expiration.Seconds())
 		g.Stats.Expires.Add(1)
 		loadErr := make(chan error)
 		var backgroundBytes []byte

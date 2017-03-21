@@ -96,7 +96,7 @@ func (w *ConfigWatcher) watchNodeList(process func(map[string]*[]byte) error) er
 	}
 
 	go func() {
-		for {
+		for { // TODO: 处理其他events，以及conn/session close
 			evt := <-ech
 			log.Infof("node list changed, evt: %+v, watching path: %s", evt, path)
 			if ech, err = watch(); err != nil {
