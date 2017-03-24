@@ -44,7 +44,7 @@ var defaultProcessFunc = func(g *Group, req *Request) *Response {
 func (p *Pipeline) bgCheck() {
 	go func() {
 		for {
-			logrus.Infof("pipeline length: %d", len(p.pipeline))
+			logrus.Debugf("pipeline length: %d", len(p.pipeline))
 			time.Sleep(time.Second)
 		}
 	}()
@@ -77,14 +77,14 @@ func (g *Group) ShutdownPipeline() {
 }
 
 func (p *Pipeline) process(i int, shutdown <-chan struct{}) {
-	logrus.Infoln("processor %d start", strconv.Itoa(i))
+	logrus.Infof("processor %d start", strconv.Itoa(i))
 	go func() {
 		for {
 			select {
 			case req := <-p.pipeline:
 				req.Resp <- p.Process(p.Group, req)
 			case <-shutdown:
-				logrus.Infoln("processor %d stopped", strconv.Itoa(i))
+				logrus.Infof("processor %d stopped", strconv.Itoa(i))
 				return
 			}
 		}
