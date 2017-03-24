@@ -120,7 +120,7 @@ func createZNodeIfNotExist(conn *zk.Conn, path string, data []byte, flags int32,
 		_, err = conn.Create(path, data, flags, acl)
 		if err != nil {
 			log.Errorln("failed to create path:", path)
-			if err != errors.New("zk: node already exists") {
+			if err != zk.ErrNodeExists {
 				return err
 			}
 		}
@@ -162,6 +162,11 @@ func (p *HTTPPool) registerSelf() error {
 	selfAddr := p.self[strings.Index(p.self, "//") + 2:]
 	if !checkAddress(selfAddr) {
 		return errors.New("invalid self address")
+	}
+
+	log.Infoln("creating parent node if not exists. path:", p.configWatcher.parentZNode)
+	if err := createZNodeIfNotExist(p.configWatcher.conn, p.configWatcher.parentZNode, nil, zkFlagPermanent, defaultACL); err != nil {
+		return err
 	}
 
 	path := joinZNode(p.configWatcher.parentZNode, GroupCacheZNode)
