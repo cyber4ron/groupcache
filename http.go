@@ -28,6 +28,8 @@ import (
 	"github.com/cyber4ron/groupcache/consistenthash"
 	pb "github.com/cyber4ron/groupcache/groupcachepb"
 	"github.com/golang/protobuf/proto"
+	"net"
+	"time"
 )
 
 const defaultBasePath = "/_groupcache/"
@@ -205,6 +207,18 @@ var bufferPool = sync.Pool{
 	New: func() interface{} { return new(bytes.Buffer) },
 }
 
+var httpTransport http.RoundTripper = &http.Transport{
+	Proxy: http.ProxyFromEnvironment,
+	DialContext: (&net.Dialer{
+		Timeout:   1 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}).DialContext,
+	MaxIdleConns:          65536,
+	IdleConnTimeout:       180 * time.Second,
+	TLSHandshakeTimeout:   10 * time.Second,
+	ExpectContinueTimeout: 1 * time.Second,
+}
+
 func (h *httpGetter) Get(context Context, in *pb.GetRequest, out *pb.GetResponse) error {
 	u := fmt.Sprintf(
 		"%v%v/%v",
@@ -216,7 +230,7 @@ func (h *httpGetter) Get(context Context, in *pb.GetRequest, out *pb.GetResponse
 	if err != nil {
 		return err
 	}
-	tr := http.DefaultTransport
+	tr := httpTransport
 	if h.transport != nil {
 		tr = h.transport(context)
 	}

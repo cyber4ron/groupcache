@@ -238,18 +238,18 @@ type flightGroup interface {
 
 // Stats are per-group statistics.
 type Stats struct {
-	Gets           AtomicInt // any Get request, including from peers
-	CacheHits      AtomicInt // either cache was good
-	PeerLoads      AtomicInt // either remote load or remote cache hit (not an error)
-	PeerErrors     AtomicInt
-	Loads          AtomicInt // (gets - cacheHits)
-	LoadsDeduped   AtomicInt // after singleflight
-	LocalLoads     AtomicInt // total good local loads
-	LocalLoadErrs  AtomicInt // total bad local loads
-	ServerRequests AtomicInt // gets that came over the network from peers
-	Expires        AtomicInt // times of request expired object
-	LoadsExpire    AtomicInt // times of reload expired object
-	Cleanups       AtomicInt // times of cleaning expired object
+	Gets           AtomicInt     // any Get request, including from peers
+	CacheHits          AtomicInt // either cache was good
+	PeerLoads          AtomicInt // either remote load or remote cache hit (not an error)
+	PeerErrors         AtomicInt
+	Loads              AtomicInt // (gets - cacheHits)
+	LoadsDeduped       AtomicInt // after singleflight
+	LocalLoads         AtomicInt // total good local loads
+	LocalLoadErrs      AtomicInt // total bad local loads
+	ServerRequests     AtomicInt // gets that came over the network from peers
+	Expires            AtomicInt // times of request expired object
+	LoadsDedupedExpire AtomicInt // times of reload expired object
+	Cleanups           AtomicInt // times of cleaning expired object
 }
 
 // Name returns the name of the group.
@@ -302,13 +302,13 @@ func (g *Group) loadAndPopulate(ctx Context, key string, dest Sink, expired bool
 }
 
 // load loads key either by invoking the getter locally or by sending it to another machine.
-// which tracks which cache the load function write. if err != nil, which should be None
+// which tracks which cache the load function write.
 func (g *Group) load(ctx Context, key string, dest Sink, expired bool) (value ByteView, which CacheType, destPopulated bool, err error) {
 	g.Stats.Loads.Add(1)
 	viewI, err := g.loadGroup.Do(key, func() (interface{}, error) {
 		which = None
 		if expired {
-			g.Stats.LoadsExpire.Add(1)
+			g.Stats.LoadsDedupedExpire.Add(1)
 		}
 		if value, _, cacheHit := g.lookupCache(key); cacheHit {
 			writeTs, err := getTimestampByteView(value)

@@ -76,7 +76,6 @@ func (g *Group) Evict(key string) {
 }
 
 // handleExpiration reloads object and populates dest if object is expired.
-// TODO: handle reload contention
 func (g *Group) handleExpiration(ctx Context, key string, dest Sink, value ByteView, which CacheType) error {
 	writeTs, err := getTimestampByteView(value)
 	if err != nil {
@@ -96,7 +95,10 @@ func (g *Group) handleExpiration(ctx Context, key string, dest Sink, value ByteV
 			if err == nil {
 				// successfully load from local or peer
 				cacheRead := which
-				// cacheWritten == None means load from peer and not cached in hot cache
+				// cacheWritten有三种取值, Main / Hot / None
+				// Main means load locally and cached in main cache
+				// Hot means load from peer and cached in hot cache
+				// None means load from peer and not cached in hot cache, or (TODO: exclude) get from cache when request intercepted by flight group
 				if cacheWritten != cacheRead || cacheWritten == None {
 					log.Debugf("cleaning group: %s, key: %s, value: %+v, age: %d, cacheRead: %v, cacheWritten: %v",
 						g.Name(), key, value, age, cacheRead, cacheWritten)
