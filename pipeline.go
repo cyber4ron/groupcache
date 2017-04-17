@@ -44,7 +44,7 @@ var defaultProcessFunc = func(g *Group, req *Request) *Response {
 func (p *Pipeline) bgCheck() {
 	go func() {
 		for {
-			logrus.Debugf("pipeline length: %d", len(p.pipeline))
+			logrus.Infoln("pipeline length: %d", len(p.pipeline))
 			time.Sleep(time.Second)
 		}
 	}()

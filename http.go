@@ -213,7 +213,7 @@ var httpTransport http.RoundTripper = &http.Transport{
 		Timeout:   1 * time.Second,
 		KeepAlive: 30 * time.Second,
 	}).DialContext,
-	MaxIdleConns:          65536,
+	MaxIdleConns:          4096,
 	IdleConnTimeout:       180 * time.Second,
 	TLSHandshakeTimeout:   10 * time.Second,
 	ExpectContinueTimeout: 1 * time.Second,
