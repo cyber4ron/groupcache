@@ -31,11 +31,13 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"fmt"
+	"strings"
 
+	log "github.com/Sirupsen/logrus"
 	pb "github.com/cyber4ron/groupcache/groupcachepb"
 	"github.com/cyber4ron/groupcache/lru"
 	"github.com/cyber4ron/groupcache/singleflight"
-	log "github.com/Sirupsen/logrus" // todo: use log provider
 )
 
 // A Getter loads data for a key.
@@ -47,13 +49,32 @@ type Getter interface {
 	// current time, and without relying on cache expiration
 	// mechanisms.
 	Get(ctx Context, key string, dest Sink) error
+
+	GetBatch(ctx Context, kvs []*KeyValue) error
 }
 
-// A GetterFunc implements Getter with a function.
+// leave GetterFunc for backward compatibility
 type GetterFunc func(ctx Context, key string, dest Sink) error
 
-func (f GetterFunc) Get(ctx Context, key string, dest Sink) error {
-	return f(ctx, key, dest)
+type GetterBatchFunc func(ctx Context, kvs []*KeyValue) error
+
+// GetterBatchFunc implements Getter
+type GCGetter []interface{}
+
+func (f GCGetter) Get(ctx Context, key string, dest Sink) error {
+	if f[0] != nil {
+		return f[0].(GetterFunc)(ctx, key, dest)
+	} else {
+		return errors.New("not implemented.")
+	}
+}
+
+func (f GCGetter) GetBatch(ctx Context, kvs []*KeyValue) error {
+	if len(f) >= 2 && f[1] != nil {
+		return f[1].(GetterBatchFunc)(ctx, kvs)
+	} else {
+		return errors.New("not implemented.")
+	}
 }
 
 const (
@@ -63,7 +84,7 @@ const (
 )
 
 var (
-	mu     sync.RWMutex
+	mu sync.RWMutex
 	groups = make(map[string]*Group)
 
 	initPeerServerOnce sync.Once
@@ -138,7 +159,7 @@ func newGroupOpts(name string, cacheBytes int64, getter Getter, peers PeerPicker
 		Concurrency: g.opt.PipelineConcurrency,
 		Capacity:    g.opt.PipelineCapacity,
 		MGetTimeout: g.opt.PipelineMGetTimeout,
-		Group:	     g,
+		Group:             g,
 		Process:     process,
 	}
 	g.pipeline.Start()
@@ -180,43 +201,43 @@ func callInitPeerServer() {
 // A Group is a cache namespace and associated data loaded spread over
 // a group of 1 or more machines.
 type Group struct {
-	name       string
-	getter     Getter
-	peersOnce  sync.Once
-	peers      PeerPicker
-	cacheBytes int64 // limit for sum of mainCache and hotCache size
+	name        string
+	getter      Getter
+	peersOnce   sync.Once
+	peers       PeerPicker
+	cacheBytes  int64 // limit for sum of mainCache and hotCache size
 
-	// mainCache is a cache of the keys for which this process
-	// (amongst its peers) is authoritative. That is, this cache
-	// contains keys which consistent hash on to this process's
-	// peer number.
-	mainCache cache
+			  // mainCache is a cache of the keys for which this process
+			  // (amongst its peers) is authoritative. That is, this cache
+			  // contains keys which consistent hash on to this process's
+			  // peer number.
+	mainCache   cache
 
-	// hotCache contains keys/values for which this peer is not
-	// authoritative (otherwise they would be in mainCache), but
-	// are popular enough to warrant mirroring in this process to
-	// avoid going over the network to fetch from a peer.  Having
-	// a hotCache avoids network hotspotting, where a peer's
-	// network card could become the bottleneck on a popular key.
-	// This cache is used sparingly to maximize the total number
-	// of key/value pairs that can be stored globally.
+			  // hotCache contains keys/values for which this peer is not
+			  // authoritative (otherwise they would be in mainCache), but
+			  // are popular enough to warrant mirroring in this process to
+			  // avoid going over the network to fetch from a peer.  Having
+			  // a hotCache avoids network hotspotting, where a peer's
+			  // network card could become the bottleneck on a popular key.
+			  // This cache is used sparingly to maximize the total number
+			  // of key/value pairs that can be stored globally.
 	hotCache    cache
 
-	// loadGroup ensures that each key is only fetched once
-	// (either locally or remotely), regardless of the number of
-	// concurrent callers.
+			  // loadGroup ensures that each key is only fetched once
+			  // (either locally or remotely), regardless of the number of
+			  // concurrent callers.
 	loadGroup   flightGroup
 
 	_           int32 // force Stats to be 8-byte aligned on 32-bit platforms
 
-	// Stats are statistics on the group.
+			  // Stats are statistics on the group.
 	Stats       Stats
 
-	// For expiration functionality.
+			  // For expiration functionality.
 	expiration  time.Duration
 	loadTimeout time.Duration
 
-	// pipeline for mget
+			  // pipeline for mget
 	pipeline    *Pipeline
 
 	opt         GroupOpts
@@ -238,7 +259,7 @@ type flightGroup interface {
 
 // Stats are per-group statistics.
 type Stats struct {
-	Gets           AtomicInt     // any Get request, including from peers
+	Gets               AtomicInt // any Get request, including from peers
 	CacheHits          AtomicInt // either cache was good
 	PeerLoads          AtomicInt // either remote load or remote cache hit (not an error)
 	PeerErrors         AtomicInt
@@ -288,6 +309,182 @@ func (g *Group) Get(ctx Context, key string, dest Sink) error {
 	return err
 }
 
+type KeyValue struct {
+	Key        string
+	Idx        int32
+	Data       []byte   // result data
+	Dest       Sink
+	Err        error
+
+	whichRead  CacheType
+	whichWrite CacheType
+	value      ByteView // for temporarily holding data
+}
+
+func NewKeyValue(key string, idx int32) *KeyValue {
+	kv := &KeyValue{
+		Key: key,
+		Idx: idx,
+		whichRead: None,
+		whichWrite: None,
+	}
+
+	kv.Data = []byte{}
+	kv.Dest = AllocatingByteSliceSink(&kv.Data)
+	return kv
+}
+
+func (g *Group) GetBatch(ctx Context, kvs []*KeyValue) error {
+	g.peersOnce.Do(g.initPeers)
+	g.Stats.Gets.Add(int64(len(kvs)))
+
+	// partition keys
+	KVsHit := []*KeyValue{}
+	KvsMiss := []*KeyValue{}
+	for _, kv := range kvs {
+		value, which, cacheHit := g.lookupCache(kv.Key)
+		if cacheHit {
+			kv.value = value
+			kv.whichRead = which
+			KVsHit = append(KVsHit, kv)
+		} else {
+			KvsMiss = append(KvsMiss, kv)
+		}
+	}
+
+	// handle hit kvs
+	KvsExpired := []*KeyValue{}
+	if len(KVsHit) != 0 {
+		g.Stats.CacheHits.Add(int64(len(KVsHit)))
+		if g.expiration > 0 {
+			var err error
+			KvsExpired, err = g.checkExpirationBatch(ctx, KVsHit);
+			if err != nil {
+				log.Errorln("[GetBatch] handleExpirationBatch failed, err:", err)
+			}
+		} else {
+			for _, kv := range KVsHit {
+				if err := setSinkView(kv.Dest, kv.value); err != nil {
+					log.Errorln("[GetBatch] setSinkView failed, err:", err)
+					kv.Err = fmt.Errorf("[GetBatch] setSinkView failed, err: %s", err.Error())
+				}
+			}
+		}
+	}
+
+	// load kvs
+	KvsToLoad := append(KvsMiss, KvsExpired...)
+	if len(KvsToLoad) != 0 {
+		if err := g.loadBatch(ctx, KvsToLoad); err != nil {
+			log.Errorln("[GetBatch] loadBatch failed, err:", err)
+		} else {
+			g.handleExpiredKeys(KvsExpired)
+		}
+	}
+
+	return nil
+}
+
+func (g *Group) Put(ctx Context, key string, value []byte, timeOffsetSec int64) error {
+	g.peersOnce.Do(g.initPeers)
+	packedBytes, err := packTimestamp(value, GetUnixTime() + timeOffsetSec)
+	if err != nil {
+		return err
+	}
+
+	if peer, ok := g.peers.PickPeer(key); ok {
+		req := &pb.PutRequest{
+			Group: &g.name,
+			Key:   &key,
+			Value: packedBytes,
+		}
+		resp := &pb.PutResponse{}
+		err := peer.Put(nil, req, resp)
+		if err != nil {
+			return err
+		}
+		log.Debugf("====> put to peer, succ, key: %s, value len: %v", key, len(packedBytes))
+		if rand.Intn(10) == 0 {
+			g.populateCache(key, ByteView{b: packedBytes}, &g.hotCache)
+		}
+	} else {
+		log.Debugf("====> putting to local, key: %s, value len: %v", key, len(packedBytes))
+		g.populateCache(key, ByteView{b: packedBytes}, &g.mainCache)
+	}
+
+	return nil
+}
+
+func (g *Group) PutBatch(ctx Context, keys []string, values [][]byte, timeOffsetSecs []int64) error {
+	g.peersOnce.Do(g.initPeers)
+
+	// sanity check
+	if len(keys) != len(values) || len(values) != len(timeOffsetSecs) {
+		log.Errorln("[PutBatch] len(keys) != len(values) || len(values) != len(timeOffsetSecs)")
+		return errors.New("[PutBatch] len(keys) != len(values) || len(values) != len(timeOffsetSecs)")
+	}
+
+	// pack timestamps
+	for i, value := range values {
+		packedBytes, err := packTimestamp(value, GetUnixTime() + timeOffsetSecs[i])
+		if err != nil {
+			log.Errorln("pack timestamp failed, err:", err)
+			continue
+		}
+		values[i] = packedBytes
+	}
+
+	// partition keys
+	peerKeys := map[ProtoGetter][]string{}
+	peerValues := map[ProtoGetter][][]byte{}
+	localKeys := []string{}
+	localValues := [][]byte{}
+	for i, key := range keys {
+		peer, ok := g.peers.PickPeer(key)
+		if !ok {
+			localKeys = append(localKeys, key)
+			localValues = append(localValues, values[i])
+		} else {
+			if _, ok := peerKeys[peer]; !ok {
+				peerKeys[peer] = []string{}
+				peerValues[peer] = [][]byte{}
+			}
+
+			peerKeys[peer] = append(peerKeys[peer], key)
+			peerValues[peer] = append(peerValues[peer], values[i])
+		}
+	}
+
+	// put to peers, todo: goroutine
+	for peer, keys := range peerKeys {
+		if len(keys) != len(peerValues[peer]) {
+			return errors.New("[PutBatch] len(keys) != len(peerValues[peer])")
+		}
+		req := &pb.PutBatchRequest{
+			Group: &g.name,
+			Keys:   keys,
+			Values: peerValues[peer],
+		}
+		resp := &pb.PutBatchResponse{}
+		if err := peer.PutBatch(nil, req, resp); err != nil {
+			return err
+		}
+		log.Debugf("====> put to peer, succ, keys: %v", keys)
+		for i, key := range keys {
+			if rand.Intn(10) == 0 {
+				g.populateCache(key, ByteView{b: peerValues[peer][i]}, &g.hotCache)
+			}
+		}
+	}
+
+	// put to local
+	for i, key := range localKeys {
+		g.populateCache(key, ByteView{b: localValues[i]}, &g.mainCache)
+	}
+
+	return nil
+}
+
 // loadAndPopulate loads the key and populates dest
 func (g *Group) loadAndPopulate(ctx Context, key string, dest Sink, expired bool) (CacheType, error) {
 	destPopulated := false
@@ -303,11 +500,11 @@ func (g *Group) loadAndPopulate(ctx Context, key string, dest Sink, expired bool
 
 // load loads key either by invoking the getter locally or by sending it to another machine.
 // which tracks which cache the load function write.
-func (g *Group) load(ctx Context, key string, dest Sink, expired bool) (value ByteView, which CacheType, destPopulated bool, err error) {
+func (g *Group) load(ctx Context, key string, dest Sink, expiredCheck bool) (value ByteView, which CacheType, destPopulated bool, err error) {
 	g.Stats.Loads.Add(1)
 	viewI, err := g.loadGroup.Do(key, func() (interface{}, error) {
 		which = None
-		if expired {
+		if expiredCheck {
 			g.Stats.LoadsDedupedExpire.Add(1)
 		}
 		if value, _, cacheHit := g.lookupCache(key); cacheHit {
@@ -331,7 +528,7 @@ func (g *Group) load(ctx Context, key string, dest Sink, expired bool) (value By
 				g.Stats.PeerLoads.Add(1)
 				return value, nil
 			}
-			log.Errorf("peer error: %v", err)
+			log.Infof("peer error: %v", err)
 			g.Stats.PeerErrors.Add(1)
 		}
 
@@ -355,6 +552,94 @@ func (g *Group) load(ctx Context, key string, dest Sink, expired bool) (value By
 	return
 }
 
+// loadBatch loads keys either by invoking the getter locally or by sending them to another machine.
+// currently called when keys are missed or expired.
+func (g *Group) loadBatch(ctx Context, kvs []*KeyValue) (err error) {
+	g.Stats.Loads.Add(int64(len(kvs)))
+
+	// partition keys
+	kvsPeer := map[ProtoGetter][]*KeyValue{}
+	kvsLocal := []*KeyValue{}
+	for _, kv := range kvs {
+		if peer, ok := g.peers.PickPeer(kv.Key); ok {
+			if _, ok := kvsPeer[peer]; !ok {
+				kvsPeer[peer] = []*KeyValue{}
+			}
+			kvsPeer[peer] = append(kvsPeer[peer], kv)
+		} else {
+			kvsLocal = append(kvsLocal, kv)
+		}
+	}
+
+	// get from peers
+	cnt := 0
+	var wg sync.WaitGroup
+	wg.Add(len(kvsPeer))
+	kvsFailedPar := make([][]*KeyValue, len(kvsPeer))
+
+	for peer, peerKvs := range kvsPeer {
+		go func(idx int, kvs []*KeyValue) {
+			kvsFailedPar[idx] = []*KeyValue{}
+			err := g.getFromPeerBatch(ctx, peer, kvs, time.Millisecond * 50)
+			if err != nil {
+				log.Errorf("[loadBatch] peer error: %v", err)
+				g.Stats.PeerErrors.Add(int64(len(kvs)))
+				kvsFailedPar[idx] = append(kvsFailedPar[idx], kvs...)
+			} else {
+				for _, kv := range kvs {
+					if kv.Err != nil {
+						log.Infof("[loadBatch] peer kv error: %v", kv.Err.Error())
+						g.Stats.PeerErrors.Add(1)
+						kvsFailedPar[idx] = append(kvsFailedPar[idx], kv)
+					}
+				}
+			}
+			wg.Done()
+		}(cnt, peerKvs)
+		cnt++
+	}
+	wg.Wait()
+
+	kvsFailed := []*KeyValue{}
+	for _, kvs := range kvsFailedPar {
+		kvsFailed = append(kvsFailed, kvs...)
+	}
+
+	// reset Err field of failed keys
+	for _, kv := range kvsFailed {
+		kv.Err = nil
+	}
+
+	// combine failed keys to local keys and get from local
+	kvsLocal = append(kvsLocal, kvsFailed...);
+	if len(kvsLocal) > 0 {
+		err = g.getter.GetBatch(ctx, kvsLocal)
+		if err != nil {
+			g.Stats.LocalLoadErrs.Add(int64((len(kvsLocal))))
+			log.Errorln("[loadBatch] GetBatch failed, err:", err)
+			errNew := fmt.Errorf("[loadBatch] GetBatch failed, err: %s", err.Error())
+			for _, kv := range kvs {
+				kv.Err = errNew
+			}
+			return errNew
+		} else {
+			// populate local keys to main cache
+			g.Stats.LocalLoads.Add(int64(len(kvsLocal)))
+			for _, kv := range kvsLocal {
+				if kv.Err != nil {
+					log.Infoln("[loadBatch] locally get failed, err:", kv.Err.Error())
+					continue
+				}
+				view, _ := kv.Dest.view()
+				g.populateCache(kv.Key, view, &g.mainCache)
+				kv.whichWrite = MainCache
+			}
+		}
+	}
+
+	return
+}
+
 func (g *Group) getLocally(ctx Context, key string, dest Sink) (ByteView, error) {
 	err := g.getter.Get(ctx, key, dest)
 	if err != nil {
@@ -370,9 +655,13 @@ func (g *Group) getFromPeer(ctx Context, peer ProtoGetter, key string) (ByteView
 		Key:   &key,
 	}
 	res := &pb.GetResponse{}
+	ts := time.Now()
 	err := peer.Get(ctx, req, res)
 	if err != nil {
 		return ByteView{}, None, err
+	}
+	if elapse := time.Since(ts); elapse > time.Millisecond * 50 {
+		log.Warnf("[groupcache] getFromPeer slow, key: %v, time: %v", key, elapse)
 	}
 	value := ByteView{b: res.Value}
 	if rand.Intn(10) == 0 {
@@ -380,6 +669,64 @@ func (g *Group) getFromPeer(ctx Context, peer ProtoGetter, key string) (ByteView
 		return value, HotCache, nil
 	}
 	return value, None, nil
+}
+
+func (g *Group) getFromPeerBatch(ctx Context, peer ProtoGetter, kvs []*KeyValue, timeout time.Duration) error {
+	if len(kvs) == 0 {
+		return nil
+	}
+
+	kvsPb := make([]*pb.KeyValue, len(kvs))
+	for i, kv := range kvs {
+		idx := (int32)(i)
+		kvsPb[i] = &pb.KeyValue{
+			Key: &kv.Key,
+			Idx: &idx,
+		}
+	}
+	req := &pb.GetBatchRequest{
+		Group:      &g.name,
+		Kvs:        kvsPb,
+	}
+	resp := &pb.GetBatchResponse{}
+
+	// get from peer. todo: load in background?
+	errCh := make(chan error)
+	go func() {
+		errCh <- peer.GetBatch(ctx, req, resp)
+	}()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			errNew := fmt.Errorf("peer.GetBatch failed, err: %s", err.Error())
+			for _, kv := range kvs {
+				kv.Err = errNew
+			}
+			return errNew
+		}
+
+		// read response value
+		for i, respKv := range resp.Kvs {
+			if respKv.Error != nil && *(respKv.Error) != "" {
+				kvs[i].Err = errors.New(*respKv.Error)
+				continue
+			}
+			setSinkView(kvs[i].Dest, ByteView{b: respKv.Value})
+			if rand.Intn(10) == 0 {
+				g.populateCache(*respKv.Key, ByteView{b: respKv.Value}, &g.hotCache)
+				kvs[i].whichWrite = HotCache
+			}
+		}
+
+	case <-timeProvider.After(timeout):
+		errNew := fmt.Errorf("peer.GetBatch timeout(%v).", timeout)
+		for _, kv := range kvs {
+			kv.Err = errNew
+		}
+		return errNew
+	}
+
+	return nil
 }
 
 func (g *Group) lookupCache(key string) (value ByteView, which CacheType, ok bool) {
@@ -568,4 +915,41 @@ type CacheStats struct {
 	Gets      int64
 	Hits      int64
 	Evictions int64
+}
+
+// for debug
+func printKV(msg string, kvs []*KeyValue) {
+	if log.GetLevel() == log.DebugLevel {
+		strs := []string{}
+		for _, kv := range kvs {
+			strs = append(strs, fmt.Sprintf("%+v", kv))
+		}
+		log.Debugf("%s %+v", msg, strings.Join(strs, ", "))
+	}
+}
+
+// for debug
+func printKVPB(msg string, kvs []*pb.KeyValue) {
+	if log.GetLevel() == log.DebugLevel {
+		strs := []string{}
+		for _, kv := range kvs {
+			strs = append(strs, fmt.Sprintf("%+v", kv))
+		}
+		log.Debugf("%s %+v", msg, strings.Join(strs, ", "))
+	}
+}
+
+// for debug
+func printKVMap(msg string, kvsMap map[ProtoGetter][]*KeyValue) {
+	if log.GetLevel() == log.DebugLevel {
+		mapStr := []string{}
+		for peer, kvs := range kvsMap {
+			kvStr := []string{}
+			for _, kv := range kvs {
+				kvStr = append(kvStr, fmt.Sprintf("%+v", kv))
+			}
+			mapStr = append(mapStr, fmt.Sprintf("{%v: %+v}", peer.(*httpGetter).baseURL, strings.Join(kvStr, ",")))
+		}
+		log.Debugf("%s, %s", msg, strings.Join(mapStr, ", "))
+	}
 }

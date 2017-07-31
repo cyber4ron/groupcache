@@ -33,10 +33,17 @@ import (
 
 	pb "github.com/cyber4ron/groupcache/groupcachepb"
 	testpb "github.com/cyber4ron/groupcache/testpb"
+	"strconv"
+	"github.com/Sirupsen/logrus"
+	"strings"
+	"net/http"
+	"os"
+	"os/exec"
+	"flag"
 )
 
 var (
-	once                    sync.Once
+	once sync.Once
 	stringGroup, protoGroup Getter
 
 	stringc = make(chan string)
@@ -51,22 +58,60 @@ var (
 
 const (
 	stringGroupName = "string-group"
-	protoGroupName  = "proto-group"
+	protoGroupName = "proto-group"
 	testMessageType = "google3/net/groupcache/go/test_proto.TestMessage"
-	fromChan        = "from-chan"
-	cacheSize       = 1 << 20
+	fromChan = "from-chan"
+	cacheSize = 1 << 20
 )
 
+func startAsPeer(level logrus.Level, expirationTime time.Duration) {
+	logrus.SetLevel(level)
+
+	logrus.Infoln("peerAddrs:", peerAddrs)
+	addrs := strings.Split(*peerAddrs, ",")
+
+	p := NewHTTPPoolOpts("http://" + addrs[*peerIndex], &HTTPPoolOptions{
+		BasePath: "/_groupcache/",
+		ConfigOpts: ConfigOpts{"127.0.0.1:2181", "/common", time.Second},
+	})
+	p.Set(addrToURL(addrs)...)
+
+	getter := GCGetter([]interface{}{GetterFunc(func(ctx Context, key string, dest Sink) error {
+		dest.SetTimestampBytes([]byte(strconv.Itoa(*peerIndex) + ":" + key), GetUnixTime())
+		return nil
+	}), GetterBatchFunc(func(ctx Context, kvs []*KeyValue) error {
+		if rand.Intn(100) == 0 {
+			return errors.New("injected batch error.")
+		}
+		printKV("--> kvs: %v", kvs)
+		for i, kv := range kvs {
+			if rand.Intn(100) == 0 {
+				kv.Err = errors.New("injected kv error.")
+				continue
+			}
+			kv.Dest.SetTimestampBytes([]byte(strconv.Itoa(*peerIndex) + ":" + kv.Key), GetUnixTime())
+			view, _ := kv.Dest.view()
+			logrus.Debugf("i: %v, view.String(): %v", i, view.String())
+		}
+		return nil
+	})})
+	g := NewGroupOpts("getBatchTest", 1 << 10, getter, nil, &GroupOpts{PipelineConcurrency: 4})
+	g.SetExpiration(expirationTime)
+
+	http.Handle(p.opts.BasePath, p)
+	logrus.Fatal(http.ListenAndServe(addrs[*peerIndex], nil))
+}
+
 func testSetup() {
-	stringGroup = NewGroup(stringGroupName, cacheSize, GetterFunc(func(_ Context, key string, dest Sink) error {
+	stringGroup = NewGroup(stringGroupName, cacheSize, GCGetter([]interface{}{func(_ Context, key string, dest Sink) error {
 		if key == fromChan {
 			key = <-stringc
 		}
 		cacheFills.Add(1)
 		return dest.SetString("ECHO:" + key)
-	}), nil)
+	}}), nil)
 
-	protoGroup = NewGroup(protoGroupName, cacheSize, GetterFunc(func(_ Context, key string, dest Sink) error {
+	protoGroup = NewGroup(protoGroupName, cacheSize, GCGetter([]interface{}{func(_ Context, key string, dest Sink) error {
 		if key == fromChan {
 			key = <-stringc
 		}
@@ -75,7 +120,7 @@ func testSetup() {
 			Name: proto.String("ECHO:" + key),
 			City: proto.String("SOME-CITY"),
 		})
-	}), nil)
+	}}), nil)
 }
 
 // tests that a Getter's Get method is only called once with two
@@ -115,7 +160,7 @@ func TestGetDupSuppressString(t *testing.T) {
 				t.Errorf("got %q; want %q", v, "ECHO:foo")
 			}
 		case <-time.After(5 * time.Second):
-			t.Errorf("timeout waiting on getter #%d of 2", i+1)
+			t.Errorf("timeout waiting on getter #%d of 2", i + 1)
 		}
 	}
 }
@@ -159,7 +204,7 @@ func TestGetDupSuppressProto(t *testing.T) {
 				t.Errorf(" Got: %v\nWant: %v", proto.CompactTextString(v), proto.CompactTextString(want))
 			}
 		case <-time.After(5 * time.Second):
-			t.Errorf("timeout waiting on getter #%d of 2", i+1)
+			t.Errorf("timeout waiting on getter #%d of 2", i + 1)
 		}
 	}
 }
@@ -207,7 +252,7 @@ func TestCacheEviction(t *testing.T) {
 	// Trash the cache with other keys.
 	var bytesFlooded int64
 	// cacheSize/len(testKey) is approximate
-	for bytesFlooded < cacheSize+1024 {
+	for bytesFlooded < cacheSize + 1024 {
 		var res string
 		key := fmt.Sprintf("dummy-key-%d", bytesFlooded)
 		stringGroup.Get(dummyCtx, key, StringSink(&res))
@@ -239,6 +284,18 @@ func (p *fakePeer) Get(_ Context, in *pb.GetRequest, out *pb.GetResponse) error 
 	return nil
 }
 
+func (p *fakePeer) GetBatch(_ Context, in *pb.GetBatchRequest, out *pb.GetBatchResponse) error {
+	return nil
+}
+
+func (p *fakePeer) Put(_ Context, in *pb.PutRequest, out *pb.PutResponse) error {
+	return nil
+}
+
+func (p *fakePeer) PutBatch(_ Context, in *pb.PutBatchRequest, out *pb.PutBatchResponse) error {
+	return nil
+}
+
 type fakePeers []ProtoGetter
 
 func (fakePeers) RegisterAndWatch() error {
@@ -267,7 +324,7 @@ func TestPeers(t *testing.T) {
 		localHits++
 		return dest.SetString("got:" + key)
 	}
-	testGroup := newGroup("TestPeers-group", cacheSize, GetterFunc(getter), peerList, nil)
+	testGroup := newGroup("TestPeers-group", cacheSize, GCGetter([]interface{}{getter, nil}), peerList, nil)
 	run := func(name string, n int, wantSummary string) {
 		// Reset counters
 		localHits = 0
@@ -395,9 +452,9 @@ func TestNoDedup(t *testing.T) {
 	const testval = "testval"
 	ts := GetUnixTime()
 	packedBytes, _ := packTimestamp([]byte(testval), ts)
-	g := newGroup("testgroup", 1024, GetterFunc(func(_ Context, key string, dest Sink) error {
+	g := newGroup("testgroup", 1024, GCGetter([]interface{}{func(_ Context, key string, dest Sink) error {
 		return dest.SetBytes(packedBytes)
-	}), nil, nil)
+	}}), nil, nil)
 
 	orderedGroup := &orderedFlightGroup{
 		stage1: make(chan bool),
@@ -459,10 +516,356 @@ func TestNoDedup(t *testing.T) {
 func TestGroupStatsAlignment(t *testing.T) {
 	var g Group
 	off := unsafe.Offsetof(g.Stats)
-	if off%8 != 0 {
+	if off % 8 != 0 {
 		t.Fatal("Stats structure is not 8-byte aligned.")
 	}
 }
+
+func TestPut(t *testing.T) {
+	getter := GCGetter([]interface{}{func(ctx Context, key string, dest Sink) error {
+		dest.SetString(strconv.Itoa(*peerIndex) + ":" + key)
+		return nil
+	}})
+
+	g := NewGroup("putTest", 1 << 10, getter, nil)
+	err := g.Put(nil, "001", []byte("x"), 2000)
+	if err != nil {
+		fmt.Println(err)
+	}
+
+	var value string
+	err = g.Get(nil, "001", StringSink(&value))
+	if err != nil {
+		fmt.Println(err)
+	}
+
+	r, ts, _ := UnpackTimestamp([]byte(value))
+	fmt.Printf("r: %v, ts: %v, now: %v\n", string(r), ts, time.Now().Unix())
+}
+
+// todo: 测cache未命中，命中，过期；从peer节点get，集群变更。检查返回的数据，cache状态。maincache中key的数量
+func TestGroup_GetBatchPeer(t *testing.T) {
+	logrus.SetLevel(logrus.DebugLevel)
+
+	flag.Parse()
+
+	expirationTime := time.Second * 2
+	if *peerChild {
+		startAsPeer(logrus.DebugLevel, expirationTime)
+		os.Exit(0)
+	}
+
+	// const nPeers = 0
+	const nPeers = 24
+
+	var allAddr []string
+	for i := 0; i < nPeers + 1; i++ {
+		allAddr = append(allAddr, pickFreeAddr(t))
+	}
+
+	logrus.Infoln("allAddr:", allAddr)
+
+	var cmds []*exec.Cmd
+	var wg sync.WaitGroup
+	for i := 0; i < nPeers; i++ {
+		cmd := exec.Command(os.Args[0],
+			"--test.run=TestGroup_GetBatchPeer",
+			"--test_peer_child",
+			"--test_peer_addrs=" + strings.Join(allAddr, ","),
+			"--test_peer_index=" + strconv.Itoa(i),
+		)
+		cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+		cmds = append(cmds, cmd)
+		wg.Add(1)
+		if err := cmd.Start(); err != nil {
+			t.Fatal("failed to start child process: ", err)
+		}
+		go awaitAddrReady(t, allAddr[i], &wg)
+	}
+	defer func() {
+		for i := 0; i < nPeers; i++ {
+			if cmds[i].Process != nil {
+				cmds[i].Process.Kill()
+			}
+		}
+	}()
+	wg.Wait()
+
+	p := NewHTTPPoolOpts("http://" + allAddr[nPeers], &HTTPPoolOptions{
+		BasePath: "/_groupcache/",
+		ConfigOpts: ConfigOpts{"127.0.0.1:2181", "/common", time.Second},
+	})
+	p.Set(addrToURL(allAddr)...)
+
+	getter := GCGetter([]interface{}{GetterFunc(func(ctx Context, key string, dest Sink) error {
+		dest.SetTimestampBytes([]byte(strconv.Itoa(*peerIndex) + ":" + key), GetUnixTime())
+		return nil
+	}), GetterBatchFunc(func(ctx Context, kvs []*KeyValue) error {
+		if rand.Intn(100) == 0 {
+			return errors.New("injected batch error.")
+		}
+		printKV("--> kvs: %v", kvs)
+		for i, kv := range kvs {
+			if rand.Intn(100) == 0 {
+				kv.Err = errors.New("injected kv error.")
+				continue
+			}
+			kv.Dest.SetTimestampBytes([]byte(strconv.Itoa(*peerIndex) + ":" + kv.Key), GetUnixTime())
+			view, _ := kv.Dest.view()
+			logrus.Debugf("i: %v, view.String(): %v", i, view.String())
+		}
+		return nil
+	})})
+	g := NewGroupOpts("getBatchTest", 1 << 20, getter, nil, &GroupOpts{PipelineConcurrency: 4})
+	g.SetExpiration(expirationTime)
+
+	// test hit / expired / miss
+
+	// cache miss
+	kvs := []*KeyValue{}
+	for i := range make([]byte, 100) {
+		// 0 - 9
+		kvs = append(kvs, NewKeyValue(fmt.Sprintf("%.3d", i), int32(i)))
+	}
+	err := g.GetBatch(nil, kvs)
+	if err != nil {
+		fmt.Println(err)
+		t.Error(err)
+	}
+
+	printKV("---> cache hit", kvs)
+	for i, kv := range kvs {
+		if kv.Err != nil {
+			logrus.Errorln("kv err, err:", kv.Err)
+			continue
+		} else {
+			view, _ := kv.Dest.view()
+			r, _, _ := UnpackTimestamp([]byte(view.ByteSlice()))
+			fmt.Printf("1, r: %v\n", string(r))
+			verifyString(t, fmt.Sprintf("%.3d", i), string(r)[strings.Index(string(r), ":") + 1:])
+		}
+	}
+
+	// cache partial hit
+	kvs = []*KeyValue{}
+	for i := range make([]byte, 100) {
+		// 5 - 14
+		kvs = append(kvs, NewKeyValue(fmt.Sprintf("%.3d", i + 50), int32(i)))
+	}
+	err = g.GetBatch(nil, kvs)
+	if err != nil {
+		fmt.Println(err)
+		t.Error(err)
+	}
+
+	printKV("---> cache partial hit", kvs)
+	for i, kv := range kvs {
+		if kv.Err != nil {
+			logrus.Errorln("kv err, err:", kv.Err)
+			continue
+		} else {
+			view, _ := kv.Dest.view()
+			r, _, _ := UnpackTimestamp([]byte(view.ByteSlice()))
+			fmt.Printf("2, r: %v\n", string(r))
+			verifyString(t, fmt.Sprintf("%.3d", i + 50), string(r)[strings.Index(string(r), ":") + 1:])
+		}
+	}
+
+	 // cache expired
+	 time.Sleep(time.Second * 3)
+	 kvs = []*KeyValue{}
+	 for i := range make([]byte, 50) {
+	 	// 0 - 4
+	 	kvs = append(kvs, NewKeyValue(fmt.Sprintf("%.3d", i), int32(i)))
+	 }
+	 err = g.GetBatch(nil, kvs)
+	 if err != nil {
+	 	fmt.Println(err)
+	 	t.Error(err)
+	 }
+	 printKV("---> cache expired", kvs)
+	 for i, kv := range kvs {
+	 	if kv.Err != nil {
+	 		logrus.Errorln("kv err, err:", kv.Err)
+	 		continue
+	 	} else {
+	 		view, _ := kv.Dest.view()
+	 		r, ts, _ := UnpackTimestamp([]byte(view.ByteSlice()))
+	 		fmt.Printf("3, r: %v, ts: %v\n", string(r), ts)
+			if time.Now().Unix() - ts > expirationTime.Nanoseconds() / 1E9 {
+				t.Errorf("expired check error, ts: %v, time.Now().Unix():%v", ts, time.Now().Unix())
+			}
+	 		verifyString(t, fmt.Sprintf("%.3d", i), string(r)[strings.Index(string(r), ":") + 1:])
+	 	}
+	 }
+
+	// cache partial expired / miss / hit
+	time.Sleep(time.Second * 1)
+	kvs = []*KeyValue{}
+	for i := range make([]byte, 50) {
+		// 0 - 4
+		kvs = append(kvs, NewKeyValue(fmt.Sprintf("%.3d", i), int32(i)))
+	}
+	err = g.GetBatch(nil, kvs)
+	if err != nil {
+		fmt.Println(err)
+		t.Error(err)
+	}
+
+	kvs = []*KeyValue{}
+	for i := range make([]byte, 250) {
+		// 0 - 24
+		kvs = append(kvs, NewKeyValue(fmt.Sprintf("%.3d", i), int32(i)))
+	}
+	err = g.GetBatch(nil, kvs)
+	if err != nil {
+		fmt.Println(err)
+		t.Error(err)
+	}
+	printKV("---> cache partial expired / miss / hit", kvs)
+	for _, kv := range kvs {
+		if kv.Err != nil {
+			logrus.Errorln("kv err, err:", kv.Err)
+			continue
+		} else {
+			view, _ := kv.Dest.view()
+			r, ts, _ := UnpackTimestamp([]byte(view.ByteSlice()))
+			fmt.Printf("4, r: %v, ts: %v\n", string(r), ts)
+			if time.Now().Unix() - ts > expirationTime.Nanoseconds() / 1E9 {
+				t.Errorf("expired check error, ts: %v, time.Now().Unix():%v", ts, time.Now().Unix())
+			}
+			verifyString(t, kv.Key, string(r)[strings.Index(string(r), ":") + 1:])
+		}
+	}
+
+	// cache stats
+	fmt.Printf("main cache statas: %+v\n", g.mainCache.stats())
+	fmt.Printf("hot cache statas: %+v\n", g.hotCache.stats())
+}
+
+func TestGroup_GetBatchPeerStress(t *testing.T) {
+	logrus.SetLevel(logrus.WarnLevel)
+
+	flag.Parse()
+
+	expirationTime := time.Second * 4
+	if *peerChild {
+		startAsPeer(logrus.WarnLevel, expirationTime)
+		os.Exit(0)
+	}
+
+	const nPeers = 48
+
+	var allAddr []string
+	for i := 0; i < nPeers + 1; i++ {
+		allAddr = append(allAddr, pickFreeAddr(t))
+	}
+
+	logrus.Infoln("allAddr:", allAddr)
+
+	var cmds []*exec.Cmd
+	var wg sync.WaitGroup
+	for i := 0; i < nPeers; i++ {
+		cmd := exec.Command(os.Args[0],
+			"--test.run=TestGroup_GetBatchPeerStress",
+			"--test_peer_child",
+			"--test_peer_addrs=" + strings.Join(allAddr, ","),
+			"--test_peer_index=" + strconv.Itoa(i),
+		)
+		cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+		cmds = append(cmds, cmd)
+		wg.Add(1)
+		if err := cmd.Start(); err != nil {
+			t.Fatal("failed to start child process: ", err)
+		}
+		go awaitAddrReady(t, allAddr[i], &wg)
+	}
+	defer func() {
+		for i := 0; i < nPeers; i++ {
+			if cmds[i].Process != nil {
+				cmds[i].Process.Kill()
+			}
+		}
+	}()
+	wg.Wait()
+
+	p := NewHTTPPoolOpts("http://" + allAddr[nPeers], &HTTPPoolOptions{
+		BasePath: "/_groupcache/",
+		ConfigOpts: ConfigOpts{"127.0.0.1:2181", "/common", time.Second},
+	})
+	p.Set(addrToURL(allAddr)...)
+
+	getter := GCGetter([]interface{}{func(ctx Context, key string, dest Sink) error {
+		dest.SetTimestampBytes([]byte(strconv.Itoa(*peerIndex) + ":" + key), GetUnixTime())
+		return nil
+	}, func(ctx Context, kvs []*KeyValue) error {
+		if rand.Intn(100) == 0 {
+			return errors.New("injected batch error.")
+		}
+		printKV("--> kvs", kvs)
+		for i, kv := range kvs {
+			if rand.Intn(100) == 0 {
+				kv.Err = errors.New("injected kv error.")
+				continue
+			}
+			kv.Dest.SetTimestampBytes([]byte(strconv.Itoa(*peerIndex) + ":" + kv.Key), GetUnixTime())
+			view, _ := kv.Dest.view()
+			logrus.Debugf("i: %v, view.String(): %v", i, view.String())
+		}
+		return nil
+	}})
+	g := NewGroupOpts("getBatchTest", 1 << 30, getter, nil, &GroupOpts{PipelineConcurrency: 4})
+	g.SetExpiration(expirationTime)
+
+	conc := 48
+	times := 100
+	batch := 100
+	keyRange := int(1E5)
+
+	ts := time.Now()
+	wg.Add(conc)
+	for c := 0; c < conc; c++ {
+		go func() {
+			for k := 0; k < times; k++ {
+				kvs := []*KeyValue{}
+				for i := 0; i < batch; i++ {
+					r := rand.Intn(keyRange)
+					kvs = append(kvs, &KeyValue{
+						Key: fmt.Sprintf("%.8d", r),
+						Idx: int32(i),
+						Dest: AllocatingByteSliceSink(&[]byte{}),
+					})
+				}
+				err := g.GetBatch(nil, kvs)
+				if err != nil {
+					fmt.Println(err)
+					continue
+				}
+				printKV("---> cache partial expired / miss / hit", kvs)
+				for _, kv := range kvs {
+					view, _ := kv.Dest.view()
+					r, ts, _ := UnpackTimestamp([]byte(view.ByteSlice()))
+					if kv.Err != nil {
+						logrus.Errorln("kv err, err:", kv.Err)
+						continue
+					}
+					// 可能会多出几秒，+8
+					if time.Now().Unix() - ts > expirationTime.Nanoseconds() / 1E9 + 8 {
+						t.Errorf("expired check error, ts: %v, time.Now().Unix():%v", ts, time.Now().Unix())
+					}
+					verifyString(t, kv.Key, string(r)[strings.Index(string(r), ":") + 1:])
+				}
+			}
+			wg.Done()
+		}()
+	}
+
+	wg.Wait()
+	fmt.Printf("elapse, %v", time.Since(ts))
+	fmt.Printf("main cache statas: %+v\n", g.mainCache.stats())
+	fmt.Printf("hot cache statas: %+v\n", g.hotCache.stats())
+}
+
 
 // TODO(bradfitz): port the Google-internal full integration test into here,
 // using HTTP requests instead of our RPC system.

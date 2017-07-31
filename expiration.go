@@ -2,7 +2,9 @@ package groupcache
 
 import (
 	"time"
-	log "github.com/Sirupsen/logrus" // todo: use log provider
+	"fmt"
+
+	log "github.com/Sirupsen/logrus"
 )
 
 type TimeProvider interface {
@@ -85,7 +87,7 @@ func (g *Group) handleExpiration(ctx Context, key string, dest Sink, value ByteV
 	age := GetUnixTime() - writeTs
 	// >=0 means expired
 	if age - int64(g.expiration.Seconds()) >= 0 {
-		log.Debugf("object expired, key: %s, age: %d, expiration: %f seconds", key, age, g.expiration.Seconds())
+		log.Debugf("object expired, key: %s, age: %d, expiration: %v", key, age, g.expiration)
 		g.Stats.Expires.Add(1)
 		loadErr := make(chan error)
 		var backgroundBytes []byte
@@ -95,10 +97,10 @@ func (g *Group) handleExpiration(ctx Context, key string, dest Sink, value ByteV
 			if err == nil {
 				// successfully load from local or peer
 				cacheRead := which
-				// cacheWritten有三种取值, Main / Hot / None
-				// Main means load locally and cached in main cache
-				// Hot means load from peer and cached in hot cache
-				// None means load from peer and not cached in hot cache, or (TODO: exclude) get from cache when request intercepted by flight group
+				// cacheWritten could be one of the following 3 values, Main / Hot / None;
+				// Main means load locally and cached in main cache;
+				// Hot means load from peer and cached in hot cache;
+				// None means load from peer and not cached in hot cache, or (TODO: exclude) get from cache when request intercepted by flight group.
 				if cacheWritten != cacheRead || cacheWritten == None {
 					log.Debugf("cleaning group: %s, key: %s, value: %+v, age: %d, cacheRead: %v, cacheWritten: %v",
 						g.Name(), key, value, age, cacheRead, cacheWritten)
@@ -124,3 +126,49 @@ func (g *Group) handleExpiration(ctx Context, key string, dest Sink, value ByteV
 	// Fall through for still cached or load timeout.
 	return setSinkView(dest, value)
 }
+
+// Note: return expired kvs
+func (g *Group) checkExpirationBatch(ctx Context, kvs []*KeyValue) ([]*KeyValue, error) {
+	// partition kvs
+	kvsExpired := []*KeyValue{}
+	kvsUnexpired := []*KeyValue{}
+	for _, kv := range kvs {
+		writeTs, err := getTimestampByteView(kv.value)
+		if err != nil {
+			log.Errorf("[handleExpirationBatch] getTimestampByteView err: %v, value: %v", err.Error(), kv.value)
+			kv.Err = fmt.Errorf("[handleExpirationBatch] getTimestampByteView failed, err: %s", err.Error())
+			continue
+		}
+		age := GetUnixTime() - writeTs
+		if age - int64(g.expiration.Seconds()) >= 0 {
+			log.Debugf("object expired, key: %s, age: %ds, expiration: %v", kv.Key, age, g.expiration)
+			g.Stats.Expires.Add(1)
+			kvsExpired = append(kvsExpired, kv)
+		} else {
+			kvsUnexpired = append(kvsUnexpired, kv)
+		}
+	}
+
+	// handle unexpired kvs
+	for _, kv := range kvsUnexpired {
+		if err := setSinkView(kv.Dest, kv.value); err != nil {
+			log.Errorln("[handleExpirationBatch] setSinkView failed, err:", err)
+			kv.Err = fmt.Errorf("[handleExpirationBatch] setSinkView failed, err: %s", err.Error())
+		}
+	}
+
+	return kvsExpired, nil
+}
+
+func (g *Group) handleExpiredKeys(kvsExpired []*KeyValue) {
+	for _, kv := range kvsExpired {
+		if kv.whichRead != None && (kv.whichWrite != kv.whichRead || kv.whichWrite == None) {
+			log.Debugf("cleaning group: %s, key: %s, value: %+v, cacheRead: %v, cacheWritten: %v",
+				g.Name(), kv.Key, kv.value, kv.whichRead, kv.whichWrite)
+			g.Stats.Cleanups.Add(1)
+			g.CleanUp(kv.Key, kv.whichRead)
+		}
+	}
+}
+
+

@@ -29,10 +29,12 @@ import (
 	"sync"
 	"testing"
 	"time"
-	"github.com/samuel/go-zookeeper/zk"
 	"hash/crc32"
 	"sort"
 	"fmt"
+
+	"github.com/samuel/go-zookeeper/zk"
+	pb "github.com/cyber4ron/groupcache/groupcachepb"
 )
 
 var (
@@ -93,9 +95,9 @@ func TestHTTPPool(t *testing.T) {
 	// Dummy getter function. Gets should go to children only.
 	// The only time this process will handle a get is when the
 	// children can't be contacted for some reason.
-	getter := GetterFunc(func(ctx Context, key string, dest Sink) error {
+	getter := GCGetter([]interface{}{func(ctx Context, key string, dest Sink) error {
 		return errors.New("parent getter called; something's wrong")
-	})
+	}})
 	g := NewGroup("httpPoolTest", 1<<20, getter, nil)
 
 	for _, key := range testKeys(nGets) {
@@ -127,10 +129,10 @@ func beChildForTestHTTPPool() {
 	})
 	p.Set(addrToURL(addrs)...)
 
-	getter := GetterFunc(func(ctx Context, key string, dest Sink) error {
+	getter := GCGetter([]interface{}{func(ctx Context, key string, dest Sink) error {
 		dest.SetString(strconv.Itoa(*peerIndex) + ":" + key)
 		return nil
-	})
+	}})
 	NewGroup("httpPoolTest", 1<<20, getter, nil)
 
 	http.Handle(p.opts.BasePath, p)
@@ -201,6 +203,12 @@ func verifyArrayInt(t *testing.T, msg string, want []int, got []int) {
 			t.Errorf("%s, Got: %d, Want:%d", msg, got, want)
 			return
 		}
+	}
+}
+
+func verifyString(t *testing.T, want, got string) {
+	if want != got {
+		t.Errorf("Got: %s, Want:%s", got, want)
 	}
 }
 
@@ -290,4 +298,111 @@ func TestConfigWatch(t *testing.T) {
 	verifyArrayInt(t, "url0, url2", getKeys(replicas, url0, url2), p.peers.Keys())
 
 	time.Sleep(time.Second * 10)
+}
+
+func TestHttpGetter_Put(t *testing.T) {
+	// create gc group
+	getter := GCGetter([]interface{}{func(ctx Context, key string, dest Sink) error {
+		dest.SetString(strconv.Itoa(*peerIndex) + ":" + key)
+		return nil
+	}})
+
+	g := NewGroup("httpPoolTest", 1<<10, getter, nil)
+
+	// start http pool
+	pool := NewHTTPPoolOpts("http://127.0.0.1:9090", &HTTPPoolOptions{
+		BasePath: "/_groupcache/",
+		ConfigOpts: ConfigOpts{"127.0.0.1:2181", "/common", time.Second},})
+	if err := pool.RegisterAndWatch(); err != nil {
+		panic(err)
+	}
+	http.Handle("/_groupcache/", pool)
+	go http.ListenAndServe("127.0.0.1:9090", nil)
+	time.Sleep(time.Second * 1)
+
+	// pack req
+	key := "001"
+	req := &pb.PutRequest{
+		Group: &g.name,
+		Key:   &key,
+		Value: []byte("x"),
+	}
+
+	// test Put
+	httpGetter := httpGetter{transport: func(Context) http.RoundTripper {
+		return httpTransport
+	}, baseURL: "http://127.0.0.1:9090/_groupcache/"}
+
+	res := &pb.PutResponse{}
+	err := httpGetter.Put(nil, req, res)
+	if err != nil {
+		fmt.Println("put err:", err)
+	}
+
+	var value string
+	if err := g.Get(nil, "001", StringSink(&value)); err != nil {
+		t.Fatal(err)
+	}
+	r, _, _ := UnpackTimestamp([]byte(value))
+
+	fmt.Println("r:", string(r))
+	verifyString(t, string(r), "x")
+}
+
+
+func TestHttpGetter_PutBatch(t *testing.T) {
+	// create gc group
+	getter := GCGetter([]interface{}{func(ctx Context, key string, dest Sink) error {
+		dest.SetString(strconv.Itoa(*peerIndex) + ":" + key)
+		return nil
+	}})
+
+	g := NewGroup("httpPoolTest", 1<<10, getter, nil)
+
+	// start http pool
+	pool := NewHTTPPoolOpts("http://127.0.0.1:9090", &HTTPPoolOptions{
+		BasePath: "/_groupcache/",
+		ConfigOpts: ConfigOpts{"127.0.0.1:2181", "/common", time.Second},})
+	if err := pool.RegisterAndWatch(); err != nil {
+		panic(err)
+	}
+	http.Handle("/_groupcache/", pool)
+	go http.ListenAndServe("127.0.0.1:9090", nil)
+	time.Sleep(time.Second * 1)
+
+	// pack req
+	keys := []string{"001", "002", "003"}
+	req := &pb.PutBatchRequest{
+		Group: &g.name,
+		Keys:   keys,
+		Values: [][]byte{[]byte("x"), []byte("y"), []byte("z")},
+	}
+
+	// test PutBatch
+	httpGetter := httpGetter{transport: func(Context) http.RoundTripper {
+		return httpTransport
+	}, baseURL: "http://127.0.0.1:9090/_groupcache/"}
+
+	res := &pb.PutBatchResponse{}
+	err := httpGetter.PutBatch(nil, req, res)
+	if err != nil {
+		fmt.Println("put err:", err)
+	}
+
+	var value string
+	if err := g.Get(nil, "001", StringSink(&value)); err != nil {
+		t.Fatal(err)
+	}
+	r, _, _ := UnpackTimestamp([]byte(value))
+
+	fmt.Println("r:", string(r))
+	verifyString(t, string(r), "x")
+
+
+	if err := g.Get(nil, "002", StringSink(&value)); err != nil {
+		t.Fatal(err)
+	}
+	r, _, _ = UnpackTimestamp([]byte(value))
+	fmt.Println("r:", string(r))
+	verifyString(t, string(r), "y")
 }

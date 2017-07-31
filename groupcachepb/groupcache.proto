@@ -18,6 +18,7 @@ syntax = "proto2";
 
 package groupcachepb;
 
+// get
 message GetRequest {
   required string group = 1;
   required string key = 2; // not actually required/guaranteed to be UTF-8
@@ -28,7 +29,54 @@ message GetResponse {
   optional double minute_qps = 2;
 }
 
+// batch get
+message KeyValue {
+    required string key = 1; // not actually required/guaranteed to be UTF-8
+    required int32 idx = 2;
+    optional bytes value = 3;
+    optional string error = 4;
+}
+
+message GetBatchRequest {
+    required string group = 1;
+    repeated KeyValue kvs = 2;
+}
+
+message GetBatchResponse {
+    repeated KeyValue kvs = 1;
+    optional double minute_qps = 2;
+}
+
+// put
+message PutRequest {
+  required string group = 1;
+  required string key = 2; // not actually required/guaranteed to be UTF-8
+  required bytes value = 3;
+}
+
+message PutResponse {
+  optional double minute_qps = 1;
+}
+
+// batch put
+message PutBatchRequest {
+    required string group = 1;
+    repeated string keys = 2; // not actually required/guaranteed to be UTF-8
+    repeated bytes values = 3;
+}
+
+message PutBatchResponse {
+    optional double minute_qps = 1;
+}
+
+// packed values
+message Entries {
+    repeated string keys = 1;
+    repeated bytes values = 2;
+}
+
+// rpc
 service GroupCache {
-  rpc Get(GetRequest) returns (GetResponse) {
-  };
+  rpc Get(GetRequest) returns (GetResponse) {};
+  rpc Put(PutRequest) returns (PutResponse) {};
 }

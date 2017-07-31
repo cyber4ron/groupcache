@@ -24,12 +24,13 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"net"
+	"time"
 
 	"github.com/cyber4ron/groupcache/consistenthash"
 	pb "github.com/cyber4ron/groupcache/groupcachepb"
 	"github.com/golang/protobuf/proto"
-	"net"
-	"time"
+	"github.com/Sirupsen/logrus"
 )
 
 const defaultBasePath = "/_groupcache/"
@@ -38,28 +39,28 @@ const defaultReplicas = 50
 
 // HTTPPool implements PeerPicker for a pool of HTTP peers.
 type HTTPPool struct {
-	// Context optionally specifies a context for the server to use when it
-	// receives a request.
-	// If nil, the server uses a nil Context.
-	Context func(*http.Request) Context
+					     // Context optionally specifies a context for the server to use when it
+					     // receives a request.
+					     // If nil, the server uses a nil Context.
+	Context       func(*http.Request) Context
 
-	// Transport optionally specifies an http.RoundTripper for the client
-	// to use when it makes a request.
-	// If nil, the client uses http.DefaultTransport.
-	Transport func(Context) http.RoundTripper
+					     // Transport optionally specifies an http.RoundTripper for the client
+					     // to use when it makes a request.
+					     // If nil, the client uses http.DefaultTransport.
+	Transport     func(Context) http.RoundTripper
 
-	// this peer's base URL, e.g. "https://example.net:8000"
-	self string
+					     // this peer's base URL, e.g. "https://example.net:8000"
+	self          string
 
-	// opts specifies the options.
-	opts HTTPPoolOptions
+					     // opts specifies the options.
+	opts          HTTPPoolOptions
 
-	mu          sync.Mutex // guards peers and httpGetters
-	peers       *consistenthash.Map
-	httpGetters map[string]*httpGetter // keyed by e.g. "http://10.0.0.2:8008"
+	mu            sync.Mutex             // guards peers and httpGetters
+	peers         *consistenthash.Map
+	httpGetters   map[string]*httpGetter // keyed by e.g. "http://10.0.0.2:8008"
 
-	// configWatcher watches config changes in zk
-	configWatcher	*ConfigWatcher
+					     // configWatcher watches config changes in zk
+	configWatcher *ConfigWatcher
 }
 
 // HTTPPoolOptions are the configurations of a HTTPPool.
@@ -74,7 +75,7 @@ type HTTPPoolOptions struct {
 
 	// HashFn specifies the hash function of the consistent hash.
 	// If blank, it defaults to crc32.ChecksumIEEE.
-	HashFn consistenthash.Hash
+	HashFn   consistenthash.Hash
 
 	// configurations of a ConfigWatcher
 	ConfigOpts
@@ -91,6 +92,22 @@ func NewHTTPPool(self string) *HTTPPool {
 }
 
 var httpPoolMade bool
+
+func GetLocalIP() []string {
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return []string{}
+	}
+	ips := []string{}
+	for _, address := range addrs {
+		if ipNet, ok := address.(*net.IPNet); ok && !ipNet.IP.IsLoopback() {
+			if ipNet.IP.To4() != nil {
+				ips = append(ips, ipNet.IP.String())
+			}
+		}
+	}
+	return ips
+}
 
 // NewHTTPPoolOpts initializes an HTTP pool of peers with the given options.
 // Unlike NewHTTPPool, this function does not register the created pool as an HTTP handler.
@@ -122,7 +139,10 @@ func NewHTTPPoolOpts(self string, o *HTTPPoolOptions) *HTTPPool {
 	}
 	p.configWatcher = watcher
 
-	RegisterPeerPicker(func() PeerPicker { return p })
+	RegisterPeerPicker(func() PeerPicker {
+		return p
+	})
+
 	return p
 }
 
@@ -165,37 +185,160 @@ func (p *HTTPPool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	groupName := parts[0]
 	key, err := url.QueryUnescape(parts[1])
 	if err != nil {
-		http.Error(w, "decoding key: "+err.Error(), http.StatusBadRequest)
+		http.Error(w, "decoding key: " + err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	// Fetch the value for this group/key.
-	group := GetGroup(groupName)
-	if group == nil {
-		http.Error(w, "no such group: "+groupName, http.StatusNotFound)
-		return
-	}
-	var ctx Context
-	if p.Context != nil {
-		ctx = p.Context(r)
-	}
+	switch strings.ToUpper(r.Method) {
+	case "GET":
+		// Fetch the value for this group/key.
+		group := GetGroup(groupName)
+		if group == nil {
+			http.Error(w, "no such group: " + groupName, http.StatusNotFound)
+			return
+		}
+		var ctx Context
+		if p.Context != nil {
+			ctx = p.Context(r)
+		}
 
-	group.Stats.ServerRequests.Add(1)
-	var value []byte
-	err = group.Get(ctx, key, AllocatingByteSliceSink(&value))
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
+		group.Stats.ServerRequests.Add(1)
+		var value []byte
+		err = group.Get(ctx, key, AllocatingByteSliceSink(&value))
+		if err != nil {
+			logrus.Debugf("====> group.Get failed, key: %s, group: %s, err: %s", groupName, key, err.Error())
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
 
-	// Write the value to the response body as a proto message.
-	body, err := proto.Marshal(&pb.GetResponse{Value: value})
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+		// Write the value to the response body as a proto message.
+		body, err := proto.Marshal(&pb.GetResponse{Value: value})
+		if err != nil {
+			logrus.Debugf("====> proto.Marshal failed, key: %s, group: %s, err: %s", groupName, key, err.Error())
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/x-protobuf")
+		w.Write(body)
+
+	// Note: BATCH_GET returns Status_OK when part of the batch request failed
+	case "BATCH_GET":
+		group := GetGroup(groupName)
+		if group == nil {
+			http.Error(w, "no such group: " + groupName, http.StatusNotFound)
+			return
+		}
+		var ctx Context
+		if p.Context != nil {
+			ctx = p.Context(r)
+		}
+
+		// construct kvs by req
+		defer r.Body.Close()
+		b := bufferPool.Get().(*bytes.Buffer)
+		b.Reset()
+		defer bufferPool.Put(b)
+		_, err = io.Copy(b, r.Body)
+
+		var req pb.GetBatchRequest
+		if err := proto.Unmarshal(b.Bytes(), &req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+		}
+
+		group.Stats.ServerRequests.Add(int64(len(req.Kvs)))
+
+		kvs := make([]*KeyValue, len(req.Kvs))
+		for i, kv := range req.Kvs {
+			kvs[i] = NewKeyValue(*kv.Key, *kv.Idx)
+		}
+		printKV("BATCH_GET", kvs)
+
+		// get values
+		err = group.GetBatch(ctx, kvs)
+		if err != nil {
+			logrus.Debugf("====> group.GetBatch failed, keys: %v, group: %s, err: %s", groupName, kvs, err.Error())
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		// construct kvsPb by kvs
+		kvsPb := make([]*pb.KeyValue, len(kvs))
+		for i, kv := range kvs {
+			kvsPb[i] = &pb.KeyValue{
+				Key: &kv.Key,
+				Idx: &kv.Idx,
+			}
+			if kv.Err != nil && kv.Err.Error() != "" {
+				s := kv.Err.Error()
+				kvsPb[i].Error = &s
+				continue
+			}
+			view, _ := kv.Dest.view()
+			kvsPb[i].Value = view.ByteSlice()
+		}
+
+		// marshal and response
+		printKVPB("BATCH_GET2:", kvsPb)
+		body, err := proto.Marshal(&pb.GetBatchResponse{Kvs: kvsPb})
+		if err != nil {
+			logrus.Debugf("====> proto.Marshal failed, key: %s, group: %s, err: %s", groupName, key, err.Error())
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/x-protobuf")
+		w.Write(body)
+
+	// single put
+	case "PUT":
+		logrus.Debugf("====> putting key, key: %s, group: %s", key, groupName)
+
+		group := GetGroup(groupName)
+		if group == nil {
+			http.Error(w, "no such group: " + groupName, http.StatusNotFound)
+			return
+		}
+		group.Stats.ServerRequests.Add(1)
+
+		defer r.Body.Close()
+		b := bufferPool.Get().(*bytes.Buffer)
+		b.Reset()
+		defer bufferPool.Put(b)
+		_, err = io.Copy(b, r.Body)
+
+		group.populateCache(key, ByteView{b: b.Bytes()}, &group.mainCache)
+		w.WriteHeader(http.StatusOK)
+
+	// batch put
+	case "BATCH_PUT":
+		group := GetGroup(groupName)
+		if group == nil {
+			http.Error(w, "no such group: " + groupName, http.StatusNotFound)
+			return
+		}
+		group.Stats.ServerRequests.Add(1)
+
+		defer r.Body.Close()
+		b := bufferPool.Get().(*bytes.Buffer)
+		b.Reset()
+		defer bufferPool.Put(b)
+		_, err = io.Copy(b, r.Body)
+
+		var entries pb.Entries
+		if err := proto.Unmarshal(b.Bytes(), &entries); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+		}
+
+		if len(entries.Keys) != len(entries.Values) {
+			http.Error(w, "batch put, len(keys) != len(values)", http.StatusBadRequest)
+			return
+		}
+		logrus.Debugf("====> putting keys, keys: %v, group: %s", entries.Keys, groupName)
+
+		for i, key := range entries.Keys {
+			group.populateCache(key, ByteView{b: entries.Values[i]}, &group.mainCache)
+		}
+		w.WriteHeader(http.StatusOK)
 	}
-	w.Header().Set("Content-Type", "application/x-protobuf")
-	w.Write(body)
 }
 
 type httpGetter struct {
@@ -204,7 +347,9 @@ type httpGetter struct {
 }
 
 var bufferPool = sync.Pool{
-	New: func() interface{} { return new(bytes.Buffer) },
+	New: func() interface{} {
+		return new(bytes.Buffer)
+	},
 }
 
 var httpTransport http.RoundTripper = &http.Transport{
@@ -213,7 +358,7 @@ var httpTransport http.RoundTripper = &http.Transport{
 		Timeout:   1 * time.Second,
 		KeepAlive: 30 * time.Second,
 	}).DialContext,
-	MaxIdleConns:          4096,
+	MaxIdleConns:          512,
 	IdleConnTimeout:       180 * time.Second,
 	TLSHandshakeTimeout:   10 * time.Second,
 	ExpectContinueTimeout: 1 * time.Second,
@@ -252,6 +397,115 @@ func (h *httpGetter) Get(context Context, in *pb.GetRequest, out *pb.GetResponse
 	err = proto.Unmarshal(b.Bytes(), out)
 	if err != nil {
 		return fmt.Errorf("decoding response body: %v", err)
+	}
+	return nil
+}
+
+func (h *httpGetter) GetBatch(context Context, in *pb.GetBatchRequest, out *pb.GetBatchResponse) error {
+	kvs := in.GetKvs()
+	if len(kvs) == 0 {
+		out = &pb.GetBatchResponse{Kvs: []*pb.KeyValue{}}
+		return nil
+	}
+
+	u := fmt.Sprintf(
+		"%v%v/%v",
+		h.baseURL,
+		url.QueryEscape(in.GetGroup()),
+		"_",
+	)
+	data, err := proto.Marshal(in)
+	req, err := http.NewRequest("BATCH_GET", u, bytes.NewBuffer(data))
+	if err != nil {
+		return fmt.Errorf("[GetBatch] http.NewRequest failed, err: %s", err.Error())
+	}
+	tr := httpTransport
+	if h.transport != nil {
+		tr = h.transport(context)
+	}
+	resp, err := tr.RoundTrip(req)
+	if err != nil {
+		return fmt.Errorf("[GetBatch] RoundTrip failed, err: %s", err.Error())
+	}
+
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("server returned: %v", resp.Status)
+	}
+
+	b := bufferPool.Get().(*bytes.Buffer)
+	b.Reset()
+	defer bufferPool.Put(b)
+	_, err = io.Copy(b, resp.Body)
+	if err != nil {
+		return fmt.Errorf("reading response body: %v", err)
+	}
+
+	err = proto.Unmarshal(b.Bytes(), out)
+	logrus.Debugf("out: %+v", out)
+	if err != nil {
+		return fmt.Errorf("decoding response body: %v", err)
+	}
+
+	return nil
+}
+
+func (h *httpGetter) Put(context Context, in *pb.PutRequest, out *pb.PutResponse) error {
+	u := fmt.Sprintf(
+		"%v%v/%v",
+		h.baseURL,
+		url.QueryEscape(in.GetGroup()),
+		url.QueryEscape(in.GetKey()),
+	)
+	req, err := http.NewRequest("PUT", u, bytes.NewBuffer(in.GetValue()))
+	if err != nil {
+		return err
+	}
+	tr := httpTransport
+	if h.transport != nil {
+		tr = h.transport(context)
+	}
+	res, err := tr.RoundTrip(req)
+	if err != nil {
+		return err
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		return fmt.Errorf("server returned: %v", res.Status)
+	}
+	return nil
+}
+
+func (h *httpGetter) PutBatch(context Context, in *pb.PutBatchRequest, out *pb.PutBatchResponse) error {
+	u := fmt.Sprintf(
+		"%v%v/%v",
+		h.baseURL,
+		url.QueryEscape(in.GetGroup()),
+		url.QueryEscape("_"), // placeholder for key
+	)
+
+	entries := pb.Entries{Keys: in.Keys, Values: in.Values}
+	data, err := proto.Marshal(&entries)
+	if err != nil {
+		logrus.Errorln("[batch put] proto marshal failed, err:", err)
+		return err
+	}
+
+	req, err := http.NewRequest("BATCH_PUT", u, bytes.NewBuffer(data))
+	if err != nil {
+		return err
+	}
+	tr := httpTransport
+	if h.transport != nil {
+		tr = h.transport(context)
+	}
+	res, err := tr.RoundTrip(req)
+	if err != nil {
+		return err
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		return fmt.Errorf("server returned: %v", res.Status)
 	}
 	return nil
 }

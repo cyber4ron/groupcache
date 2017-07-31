@@ -30,6 +30,9 @@ type Context interface{}
 // ProtoGetter is the interface that must be implemented by a peer.
 type ProtoGetter interface {
 	Get(context Context, in *pb.GetRequest, out *pb.GetResponse) error
+	GetBatch(context Context, in *pb.GetBatchRequest, out *pb.GetBatchResponse) error
+	Put(context Context, in *pb.PutRequest, out *pb.PutResponse) error
+	PutBatch(context Context, in *pb.PutBatchRequest, out *pb.PutBatchResponse) error
 }
 
 // PeerPicker is the interface that must be implemented to locate
